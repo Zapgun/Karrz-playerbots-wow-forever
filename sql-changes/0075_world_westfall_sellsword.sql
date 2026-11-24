@@ -25,6 +25,7 @@
 -- Undo: run sql-changes/undo/undo_0075_world_westfall_sellsword.sql
 
 DELETE FROM creature WHERE guid = 61100300;
+DELETE FROM creature_template_gossip WHERE CreatureID = 6110030;
 DELETE FROM creature_template_model WHERE CreatureID = 6110030;
 DELETE FROM creature_template WHERE entry = 6110030;
 
@@ -51,6 +52,14 @@ FROM creature_template WHERE entry = 6110000;
 INSERT INTO creature_template_model
     (CreatureID, Idx, CreatureDisplayID, DisplayScale, Probability, VerifiedBuild)
 VALUES (6110030, 0, 1598, 1, 1, 0);
+
+-- Without a gossip row the client is told the NPC has no gossip and strips the
+-- talk cursor (same fix as the 39 brokers in
+-- sql/custom/world/2026_11_01_20_world_forever_hire_broker_gossip.sql).
+-- Menu 6110000 is the shared broker menu; npc_fb_hire_broker builds the options.
+INSERT INTO creature_template_gossip
+    (CreatureID, MenuID, VerifiedBuild)
+VALUES (6110030, 6110000, 0);
 
 INSERT INTO creature
     (guid, id, map, zoneId, areaId, spawnDifficulties, phaseUseFlags,
