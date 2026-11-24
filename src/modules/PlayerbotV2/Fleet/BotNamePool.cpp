@@ -125,8 +125,8 @@ char const* NameTable(uint8 pool)
 }
 
 // Which of our tables actually exist in the shared schema. The surname /
-// curated tables ship via sql-changes, not a module migration, so a server
-// that hasn't applied them yet must not spam a failing SELECT every boot.
+// curated tables come from the bot migrations 0063/0064; a server that has
+// not run them yet must not spam a failing SELECT every boot.
 bool g_probed        = false;
 bool g_has_race_names = false;
 bool g_has_surnames   = false;
@@ -151,7 +151,7 @@ void ProbeTables()
     if (!g_has_race_names || !g_has_surnames || !g_has_parts)
         TC_LOG_WARN("playerbot.v2",
             "[BotNamePool] RPG-name tables missing in {} (race_names={} surnames={} parts={}) — "
-            "apply sql-changes/0073_playerbot_rpg_names.sql to enable them.",
+            "the bot migrations 0063/0064 (sql/playerbot_v2) add them.",
             SharedDb(), g_has_race_names, g_has_surnames, g_has_parts);
 }
 

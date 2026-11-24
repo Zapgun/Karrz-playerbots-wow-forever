@@ -19,19 +19,9 @@ The bots are part of the server program, so you need a `worldserver.exe` that wa
 
 ## B. Building from source
 
-Build from the `forever-bots` branch of https://github.com/Karrz1/TrinityCore. It already has the bot module, the
-module loader and the core wiring in it; nothing needs to be copied over it. (Copying the files of
-Karrz-playerbots-wow-forever over advocaite's `forever` does not work: that repository only holds an older, partial copy.)
-All paths below are inside that checkout.
-
-1. Get the source and build it as for the plain Forever server, adding one option:
-   ```
-   git clone -b forever-bots https://github.com/Karrz1/TrinityCore.git ForeverCore-bots
-   cd ForeverCore-bots
-   cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DSERVERS=1 -DSCRIPTS=static -DBUILD_PLAYERBOT_V2=1
-   ```
-   When the option is picked up, CMake prints `Playerbot V2 module enabled` and `Modules: AddSC_playerbot_v2`.
-   Then `cmake --build build --config RelWithDebInfo --target worldserver`. Needs the usual
+1. Build as for the plain Forever server, adding one option:
+   `cmake -S . -B build -DSERVERS=1 -DSCRIPTS=static -DBUILD_PLAYERBOT_V2=1`
+   then `cmake --build build --config RelWithDebInfo --target worldserver`. Needs the usual
    TrinityCore requirements (Visual Studio 2022 or newer on Windows, Boost, OpenSSL, MySQL
    8 client). Without `-DBUILD_PLAYERBOT_V2=1` you get the unchanged server and no bots.
 2. The build puts `playerbot.conf.dist` into `worldserver.conf.d`. Run `cmake --install` or copy
@@ -42,7 +32,7 @@ All paths below are inside that checkout.
 ## Steps for everyone
 
 Optional first: the vanilla (1.12) numbers. They are not in the repository; they are built from the VMaNGOS database dump you download yourself,
-with the builder in `tools/classic_spell_values/` of the Karrz-playerbots-wow-forever repository (one command, see its README). Without them the bots and the server use the client's own values.
+with a builder script that is not part of this branch. Without them the bots and the server use the client's own values.
 
 3. **Create the shared bot database (once).** In a command prompt, from this folder
    (use your own MySQL user; `mysql.exe` is in your MySQL `bin` folder):
@@ -58,7 +48,7 @@ with the builder in `tools/classic_spell_values/` of the Karrz-playerbots-wow-fo
    without further setup. The raid and instance shortcuts that are not Blizzlike (solo raid entry, no attunements, no Molten Core runes,
    open Ahn'Qiraj gates; see `doc/OptionalServerOptions.md`) are in that file but commented out; remove the `#` to use them.
    Optionally rename `playerbot.conf.dist` to `playerbot.conf` to change other bot settings (every key is documented there).
-   `examples\zz-forever-bots.conf` in the Karrz-playerbots-wow-forever repository is the older optional version (shortcuts switched on, faster raid casting, 300 bots); copy it over to use that.
+   `examples\zz-forever-bots.conf` is the older optional version (shortcuts switched on, faster raid casting, 300 bots); copy it over to use that.
    Change a value and restart to tune; set `Playerbot.World.Enable = 0` for no roaming bots,
    `AuctionHouseBot.Seller.Enabled = 0` for no auction bot. Weak PC: set `Playerbot.World.MaxBots = 100`,
    `BotsPerPlayer = 40`, `CityBots = 40` and `ZoneBots = 20`. Expect about 2.9 GB of RAM for the server plus about 4 MB per awake bot (about 3.8 GB at 220 bots).
@@ -82,6 +72,10 @@ console: `account set gmlevel <accountname> 3 -1`).
 - Raids: add the bots, enter the instance, use the window's Pull and Release. A good Molten Core
   group is 4 tanks, 12 healers, 6 mages, 4 warlocks, 3 hunters, 5 rogues, 4 warriors.
 - Battlegrounds: queue yourself; bots fill the other places.
+- Hired bots: a Sellsword Captain stands beside the innkeeper of 30 towns, a Veteran Recruiter in each capital and a
+  Black Market Broker in Gadgetzan, Booty Bay and Ratchet. Talk to one to hire a bot for gold (Veterans and Legends wear
+  raid and best-in-slot gear at the level cap). Free bots stay the default; `Playerbot.Hire.Mode = 1` makes the realm
+  hired bots only. Everything about them: `src/modules/PlayerbotV2/Hire/README.md`.
 
 ## Updating, removing, reporting problems
 

@@ -28,24 +28,49 @@ CollectAndAddSourceFiles(
 if(NOT BUILD_PLAYERBOT_V2)
   set(TESTS_MODULE_ONLY_SOURCES
     ClassicAddonHint.cpp
+    ClassicTalentCode.cpp
+    ClassicBotBridge.cpp
     ClassicBotConversation.cpp
+    ClassicChannelTalk.cpp
+    ClassicPartyTalk.cpp
+    ClassicBotMigrations.cpp
+    ClassicGuildAskText.cpp
+    ClassicBotLocale.cpp
+    ClassicCompanionLeash.cpp
+    ClassicHirePolicy.cpp
+    ClassicMeleeReach.cpp
+    ClassicFalseCombatEscape.cpp
     ClassicFollowDrop.cpp
+    ClassicBotSwim.cpp
     ClassicGroupControl.cpp
+    ClassicGroupFight.cpp
     ClassicGroupOrderText.cpp
+    ClassicCcDeny.cpp
+    ClassicOwnerPicks.cpp
+    ClassicAoeDeny.cpp
+    ClassicCompanionDelete.cpp
+    ClassicHumanLogin.cpp
     ClassicInstanceFullHold.cpp
     ClassicArmorSwapGate.cpp
+    ClassicArmorTypeFit.cpp
     ClassicBotCustomizationRoll.cpp
     ClassicBotListedGroupPlan.cpp
     ClassicLfgRoleGap.cpp
+    ClassicDungeonFinderPlan.cpp
     ClassicRaidConsumables.cpp
     ClassicRaidDispel.cpp
+    ClassicRaidLoadout.cpp
+    ClassicBisPools.cpp
     ClassicRaidFightScript.cpp
     ClassicRaidGeometry.cpp
     ClassicRaidRagnaros.cpp
     ClassicRaidResistPotions.cpp
     ClassicDrinkSay.cpp
     ClassicReactionTiming.cpp
-    ClassicReactionWake.cpp)
+    ClassicReactionWake.cpp
+    ClassicBotSize.cpp
+    ClassicPlacement.cpp
+    ClassicWorldPvp.cpp)
   foreach(_test_source ${TESTS_MODULE_ONLY_SOURCES})
     set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/game/${_test_source} PROPERTIES HEADER_FILE_ONLY TRUE)
   endforeach()
