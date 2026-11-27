@@ -1,14 +1,18 @@
 # namegen — bot name seed drafts
 
-Per-race/sex name data for the V2 bot name generator (code side:
-`patches/0002_bot_rpg_names.patch`). Drafts are small, individually runnable
-`INSERT IGNORE` files so they're easy to review and hand-edit; `merge.py`
-concatenates them into `../0074_playerbot_rpg_names_data.sql`.
+Per-race/sex name data for the V2 bot name generator. The code merged upstream
+(ForeverCore PR #394) and ships in the module; the tables and the seed data made
+from these drafts apply themselves at server startup as the bot migrations
+0063/0064 (sql/playerbot_v2) — the sql-changes/0073+0074 manual-apply files they
+replaced are gone. Drafts are small, individually runnable `INSERT IGNORE`
+files so they're easy to review and hand-edit; `merge.py` concatenates them
+into `merged_data.sql` here in this folder.
 
-Apply order on the shared playerbot DB (`Playerbot.SharedDatabase`):
-
-    0073_playerbot_rpg_names.sql       # tables
-    0074_playerbot_rpg_names_data.sql  # this merged seed data
+To ship extended or edited names: re-run merge.py, then fold the output into a
+NEW fork-local 9xxx migration in sql/playerbot_v2 (never edit upstream's 0064)
+— same INSERTs, with the table names written `{SHARED}.\`playerbots_race_names\``
+etc. as in 0064. INSERT IGNORE makes re-seeding safe; rows already consumed by
+bots are untouched either way.
 
 ## Files
 
