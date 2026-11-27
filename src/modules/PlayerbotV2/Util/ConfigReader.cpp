@@ -7,6 +7,7 @@
 #include "StringConvert.h"
 #include "Util.h"
 #include <algorithm>
+#include <cctype>
 
 namespace Playerbot {
 
@@ -424,6 +425,11 @@ void ConfigReader::apply_from_loaded_config()
         g.use_chat_model   = c.GetBoolDefault("Playerbot.World.Gathering.UseChatModel", true, true);
         g.model_per_minute = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.Gathering.ChatModelPerMinute", 4, true), 1, 60));
         g.city_chats       = uint32(std::clamp<int64_t>(c.GetIntDefault("Playerbot.World.Gathering.CityChats", 3, true), 0, 6));
+        {
+            std::string style = c.GetStringDefault("Playerbot.World.Gathering.TalkStyle", "players", true);
+            std::transform(style.begin(), style.end(), style.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+            g.rp_talk = style == "rp";
+        }
     }
     bhv_quest_accept_         = c.GetBoolDefault("Playerbot.Behavior.QuestAccept", true, true);
     bhv_quest_share_          = c.GetBoolDefault("Playerbot.Behavior.QuestShare", true, true);

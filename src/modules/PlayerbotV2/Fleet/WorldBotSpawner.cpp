@@ -57,6 +57,7 @@
 #include "../Bot/World/SpreadSpot.h"
 #include "Config.h"
 #include "GameTime.h"
+#include "Weather.h"
 #include "DatabaseEnv.h"
 #include "Group.h"
 #include "GroupMgr.h"
@@ -2426,6 +2427,48 @@ std::string GatherZoneName(uint32 zone)
     return e ? std::string(e->AreaName[LOCALE_enUS]) : std::string();
 }
 
+// The zone's weather as a Gathering talk category (Gathering.h's kWeather*).
+uint8 GatherWeatherCat(WeatherState w)
+{
+    using namespace ::Playerbot::V2::Gathering;
+    switch (w)
+    {
+        case WEATHER_STATE_DRIZZLE:
+        case WEATHER_STATE_LIGHT_RAIN:
+        case WEATHER_STATE_MEDIUM_RAIN:
+        case WEATHER_STATE_HEAVY_RAIN:
+        case WEATHER_STATE_THUNDERS:
+        case WEATHER_STATE_BLACKRAIN:          return kWeatherRain;
+        case WEATHER_STATE_LIGHT_SNOW:
+        case WEATHER_STATE_MEDIUM_SNOW:
+        case WEATHER_STATE_HEAVY_SNOW:
+        case WEATHER_STATE_BLACKSNOW:          return kWeatherSnow;
+        case WEATHER_STATE_LIGHT_SANDSTORM:
+        case WEATHER_STATE_MEDIUM_SANDSTORM:
+        case WEATHER_STATE_HEAVY_SANDSTORM:    return kWeatherSand;
+        case WEATHER_STATE_FOG:                return kWeatherFog;
+        default:                               return kWeatherAny;
+    }
+}
+
+// The server clock's hour (the same clock the chat bridge's time_of_day follows).
+int GatherLocalHour()
+{
+    std::time_t const t = GameTime::GetGameTime();
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &t);
+#else
+    localtime_r(&t, &local);
+#endif
+    return local.tm_hour;
+}
+
+char const* GatherTimeWord(int hour)
+{
+    return hour < 5 ? "night" : hour < 12 ? "morning" : hour < 18 ? "afternoon" : hour < 22 ? "evening" : "night";
+}
+
 // A said line goes through the bot's intent queue, like every other chat line of a bot.
 void GatherSay(uint64 bot, std::string text)
 {
@@ -2605,7 +2648,7 @@ void WorldBotSpawner::DriveGatherings(uint32 now_ms, std::vector<Anchor> const& 
             GD::City const& city = GD::kCities[r.city];
             auto const end_talk = [&]()
             {
-                r.script = -1; r.model = false; r.waiting = false; r.chat.clear();
+                r.script = -1; r.model = false; r.waiting = false; r.rp = false; r.chat.clear();
                 r.next_line_ms = now_ms + cfg.talk_gap_ms + urand(0, cfg.talk_gap_ms / 2u);
             };
             auto const emote = [&](Player* p, uint16 e)
@@ -2614,16 +2657,43 @@ void WorldBotSpawner::DriveGatherings(uint32 now_ms, std::vector<Anchor> const& 
             };
             auto const start_script = [&]()
             {
-                std::vector<std::size_t> pool = ScriptsFor(city.alliance, r.talkers.size(), IsStreet(r.ring));
+                std::vector<std::size_t> pool;
+                if (cfg.rp_talk)
+                {
+                    // The rp scripts gate on what this ring actually has: a race among the talkers, the weather over the zone, nightfall.
+                    TalkEnv env;
+                    int const hour = GatherLocalHour();
+                    env.night = hour < 5 || hour >= 22;
+                    for (uint64 const id : r.talkers)
+                        if (Player* p = find(id))
+                        {
+                            env.race_mask |= (std::uint32_t(1) << p->GetRace());
+                            if (env.weather == kWeatherAny && p->GetMap())
+                                env.weather = GatherWeatherCat(p->GetMap()->GetZoneWeather(p->GetZoneId()));
+                        }
+                    pool = RpScriptsFor(city.alliance, r.talkers.size(), IsStreet(r.ring), env);
+                }
+                else
+                    pool = ScriptsFor(city.alliance, r.talkers.size(), IsStreet(r.ring));
                 std::vector<std::size_t> fresh;
                 for (std::size_t i : pool)
                     if (std::find(r.recent.begin(), r.recent.end(), uint32(i)) == r.recent.end()) fresh.push_back(i);
                 if (fresh.empty()) { r.recent.clear(); fresh = pool; }
                 if (fresh.empty()) { end_talk(); return; }
                 r.script = int32(fresh[urand(0, uint32(fresh.size() - 1))]);
+                r.rp = cfg.rp_talk;
                 r.line = 0;
                 r.recent.push_back(uint32(r.script));
                 if (r.recent.size() > 8u) r.recent.erase(r.recent.begin());
+                // A race-gated rp script speaks to a talker of that race as {1}: seat one there.
+                if (r.rp && r.talkers.size() > 1u)
+                    if (uint8 const need = RpScripts()[std::size_t(r.script)].race)
+                        for (std::size_t i = 0; i < r.talkers.size(); ++i)
+                            if (Player* p = find(r.talkers[i]); p && p->GetRace() == need)
+                            {
+                                if (i != 1u) std::swap(r.talkers[1], r.talkers[i]);
+                                break;
+                            }
             };
 
             if (r.script < 0 && !r.model)
@@ -2641,7 +2711,9 @@ void WorldBotSpawner::DriveGatherings(uint32 now_ms, std::vector<Anchor> const& 
                     {
                         r.model = true; r.waiting = false; r.chat.clear();
                         r.turns_left = 3u + urand(0, 3);
-                        r.topic = urand(0, uint32((IsStreet(r.ring) ? kStreetTopicCount : kTopicCount) - 1));
+                        r.topic = urand(0, uint32((IsStreet(r.ring)
+                            ? (cfg.rp_talk ? RpStreetTopicCount(city.alliance) : kStreetTopicCount)
+                            : (cfg.rp_talk ? RpTopicCount(city.alliance) : kTopicCount)) - 1));
                         r.key = (uint64(0x6A7Bu) << 48) | (++gather_seq_ & 0xFFFFFFFFFFFFull);
                     }
                     else
@@ -2686,26 +2758,59 @@ void WorldBotSpawner::DriveGatherings(uint32 now_ms, std::vector<Anchor> const& 
                         std::string others;
                         for (uint64 const id : r.talkers)
                             if (Player* o = find(id); o && o != sp)
+                            {
                                 others += (others.empty() ? "" : " and ") + std::string(o->GetName());
+                                if (cfg.rp_talk)
+                                    if (char const* orace = GatherRaceName(o->GetRace()); *orace)
+                                        others += " the " + std::string(orace) + " " + GatherClassName(o->GetClass());
+                            }
                         std::string sys = "You are " + sp->GetName() + ", a level " + std::to_string(sp->GetLevel()) + " ";
                         if (char const* race = GatherRaceName(sp->GetRace()); *race) sys += std::string(race) + " ";
                         sys += GatherClassName(sp->GetClass());
-                        sys += " playing World of Warcraft Classic (the original 2004 game).";
-                        if (IsStreet(r.ring))
+                        if (cfg.rp_talk)
                         {
-                            sys += " You are standing near " + r.place + " in " + city.name + ", face to face with " + (others.empty() ? std::string("a friend") : others)
-                                + ", chatting in /say while people walk past.";
-                            sys += std::string(" The talk is about ") + kStreetTopics[r.topic % kStreetTopicCount] + ".";
+                            // TalkStyle = rp: the bot is a person of Azeroth, not a player - the same /say talk, in character.
+                            sys += std::string(" of the ") + (city.alliance ? "Alliance" : "Horde")
+                                + ", a citizen of Azeroth. Stay in character: this world is your life, not a game.";
+                            if (IsStreet(r.ring))
+                            {
+                                sys += " You are standing near " + r.place + " in " + city.name + ", face to face with " + (others.empty() ? std::string("a friend") : others)
+                                    + ", talking in /say while people walk past.";
+                                sys += std::string(" The talk is about ") + RpStreetTopic(city.alliance, r.topic) + ".";
+                            }
+                            else
+                            {
+                                sys += std::string(" You are ") + (r.sit ? "sitting around a campfire" : "standing with a few others") + " just outside the gates of "
+                                    + city.name + ", in " + GatherZoneName(sp->GetZoneId()) + ", talking in /say with " + (others.empty() ? std::string("a friend") : others) + ".";
+                                sys += std::string(" The talk is about ") + RpTopic(city.alliance, r.topic) + ".";
+                            }
+                            int const hour = GatherLocalHour();
+                            char const* w = WeatherCatWord(GatherWeatherCat(sp->GetMap() ? sp->GetMap()->GetZoneWeather(sp->GetZoneId()) : WEATHER_STATE_FINE));
+                            sys += std::string(" It is ") + GatherTimeWord(hour) + " and the weather is " + (*w ? w : "clear") + ".";
+                            sys += " Write only your own next line: one short line under 15 words, plain spoken words, in character - speak of the land,"
+                                   " the war, your people, the road; never the game, real life, or being a player or a bot. No emojis,"
+                                   " no actions in asterisks, no quotation marks, no name prefix. You may answer the others or tease them by name or race."
+                                   " Don't invent quests, items or places.";
                         }
                         else
                         {
-                            sys += std::string(" You are ") + (r.sit ? "sitting around a campfire" : "standing with a few others") + " just outside the gates of "
-                                + city.name + ", in " + GatherZoneName(sp->GetZoneId()) + ", chatting in /say with " + (others.empty() ? std::string("a friend") : others) + ".";
-                            sys += std::string(" The talk is about ") + kTopics[r.topic % kTopicCount] + ".";
+                            sys += " playing World of Warcraft Classic (the original 2004 game).";
+                            if (IsStreet(r.ring))
+                            {
+                                sys += " You are standing near " + r.place + " in " + city.name + ", face to face with " + (others.empty() ? std::string("a friend") : others)
+                                    + ", chatting in /say while people walk past.";
+                                sys += std::string(" The talk is about ") + kStreetTopics[r.topic % kStreetTopicCount] + ".";
+                            }
+                            else
+                            {
+                                sys += std::string(" You are ") + (r.sit ? "sitting around a campfire" : "standing with a few others") + " just outside the gates of "
+                                    + city.name + ", in " + GatherZoneName(sp->GetZoneId()) + ", chatting in /say with " + (others.empty() ? std::string("a friend") : others) + ".";
+                                sys += std::string(" The talk is about ") + kTopics[r.topic % kTopicCount] + ".";
+                            }
+                            sys += " Write only your own next line: one short line under 15 words, casual, like a player typing in game chat, no emojis,"
+                                   " no actions in asterisks, no quotation marks, no name prefix. You may answer the others or tease them by name."
+                                   " Never say you are a bot or a program. Don't invent quests, items or places.";
                         }
-                        sys += " Write only your own next line: one short line under 15 words, casual, like a player typing in game chat, no emojis,"
-                               " no actions in asterisks, no quotation marks, no name prefix. You may answer the others or tease them by name."
-                               " Never say you are a bot or a program. Don't invent quests, items or places.";
                         sys += " " + ::Playerbot::V2::World::VanillaLevelPlaces(uint8(sp->GetLevel()));
                         if (!Services::Config().chat_model().extra_prompt.empty())
                             sys += " " + Services::Config().chat_model().extra_prompt;
@@ -2727,7 +2832,7 @@ void WorldBotSpawner::DriveGatherings(uint32 now_ms, std::vector<Anchor> const& 
 
             if (!r.model && r.script >= 0 && now_ms >= r.next_line_ms)
             {
-                Script const& sc = Scripts()[std::size_t(r.script)];
+                Script const& sc = (r.rp ? RpScripts() : Scripts())[std::size_t(r.script)];
                 if (r.line >= sc.lines.size())
                     end_talk();
                 else
@@ -2741,7 +2846,31 @@ void WorldBotSpawner::DriveGatherings(uint32 now_ms, std::vector<Anchor> const& 
                         std::vector<std::string> names;
                         for (uint64 const id : r.talkers)
                             if (Player* o = find(id)) names.push_back(o->GetName()); else names.push_back("friend");
-                        std::string text = Fill(ln.text, city.name, GatherZoneName(sp->GetZoneId()), names);
+                        std::string text;
+                        if (r.rp)
+                        {
+                            // The rp placeholders: each talker's race and home, the speaker's own, the zone's weather, the other side.
+                            FillCtx fctx;
+                            fctx.city = city.name;
+                            fctx.zone = GatherZoneName(sp->GetZoneId());
+                            fctx.names = names;
+                            for (uint64 const id : r.talkers)
+                                if (Player* o = find(id))
+                                {
+                                    fctx.races.push_back(GatherRaceName(o->GetRace()));
+                                    fctx.homes.push_back(RaceHome(o->GetRace()));
+                                }
+                                else { fctx.races.emplace_back(); fctx.homes.emplace_back(); }
+                            if (sp->GetMap())
+                                fctx.weather = WeatherCatWord(GatherWeatherCat(sp->GetMap()->GetZoneWeather(sp->GetZoneId())));
+                            fctx.race = GatherRaceName(sp->GetRace());
+                            fctx.home = RaceHome(sp->GetRace());
+                            fctx.enemy = city.alliance ? "the Horde" : "the Alliance";
+                            fctx.leader = RaceLeader(sp->GetRace());
+                            text = Fill(ln.text, fctx);
+                        }
+                        else
+                            text = Fill(ln.text, city.name, GatherZoneName(sp->GetZoneId()), names);
                         emote(sp, ln.emote);
                         r.next_line_ms = now_ms + LinePause(text.size(), urand(0, 0xFFFF));
                         GatherSay(sp->GetGUID().GetCounter(), std::move(text));

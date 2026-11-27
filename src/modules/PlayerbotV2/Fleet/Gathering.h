@@ -5,6 +5,9 @@
 // (Bot/States/Rules/AmbientRules.cpp). With Playerbot.ChatModel on, the lines come from the chat model instead of the scripts
 // (BotChatModel::AskSay). Tested in tests/game/ClassicGathering.cpp.
 //
+// TalkStyle = rp: the talk is in character (RpScripts, RP topics, an in-character model prompt): the talkers speak as people of
+// Azeroth - race, homeland, the war, the zone's weather, the Defias outside Stormwind - instead of players chatting about the game.
+//
 // Street chats (Playerbot.World.Gathering.CityChats): inside a capital, where a real player walks, two to four world bots stand
 // together by the bank, the auction house, the inn, a shop or a mailbox, turned to each other, and talk face to face in /say with
 // a gesture on each line. Same driver, same talk; their ring numbers start at kStreetRing.
@@ -140,7 +143,21 @@ constexpr std::size_t kStreetTopicCount = sizeof(kStreetTopics) / sizeof(kStreet
 // 2 Horde. `emote`: an emote the speaker plays with the line when standing (0 none).
 
 struct Line { std::uint8_t who; char const* text; std::uint16_t emote; };
-struct Script { std::uint8_t faction; std::uint8_t talkers; std::vector<Line> lines; };
+
+// A script's weather gate (RpScripts only): kWeatherBad matches any real weather, the rest are the categories the driver maps the
+// zone's WeatherState onto (rain, snow, sandstorm, fog).
+constexpr std::uint8_t kWeatherAny = 0, kWeatherRain = 1, kWeatherSnow = 2, kWeatherSand = 3, kWeatherFog = 4, kWeatherBad = 5;
+
+struct Script
+{
+    std::uint8_t faction;                     // 0 both, 1 Alliance, 2 Horde
+    std::uint8_t talkers;                     // people the script needs
+    std::vector<Line> lines;
+    // Optional gates (RpScripts only; the stock table leaves them zero = always fits)
+    std::uint8_t weather = kWeatherAny;       // a kWeather* the talk only makes sense under
+    std::uint8_t race = 0;                    // a RACE_* that must be among the talkers; the driver seats it at talker slot 1
+    bool night = false;                       // only after dark
+};
 
 constexpr std::uint16_t kTalk = 1, kBow = 2, kCheer = 4, kExclaim = 5, kQuestion = 6, kLaugh = 11, kPoint = 25, kYes = 273, kNo = 274;
 
@@ -265,8 +282,24 @@ inline std::vector<std::size_t> ScriptsFor(bool alliance, std::size_t talkers, b
     return out;
 }
 
-// A script line with its placeholders filled.
-inline std::string Fill(char const* text, std::string const& city, std::string const& zone, std::vector<std::string> const& names)
+// A script line with its placeholders filled. `{0}` `{1}` `{2}` are the talkers' names; the rp context adds `{weather}` (the word for
+// the zone's weather, empty when clear), `{race}` `{home}` `{leader}` (the speaker's), `{enemy}` (the other side, "the Alliance" /
+// "the Horde") and `{r0}` `{r1}` `{r2}` `{h0}` `{h1}` `{h2}` (each talker's race word and racial capital).
+struct FillCtx
+{
+    std::string city;
+    std::string zone;
+    std::vector<std::string> names;              // a talker's name per slot
+    std::vector<std::string> races;              // a talker's race word per slot ("dwarf")
+    std::vector<std::string> homes;              // a talker's racial capital per slot ("Ironforge")
+    std::string weather;                         // the word for the zone's weather ("rain"), empty when clear
+    std::string race;                            // the speaker's race word
+    std::string home;                            // the speaker's racial capital
+    std::string enemy;                           // "the Alliance" / "the Horde" - the side the ring is not on
+    std::string leader;                          // the speaker's racial leader ("Thrall", "the Dark Lady")
+};
+
+inline std::string Fill(char const* text, FillCtx const& ctx)
 {
     std::string out;
     for (char const* p = text; *p; ++p)
@@ -278,13 +311,21 @@ inline std::string Fill(char const* text, std::string const& city, std::string c
             if (*e == '}')
             {
                 std::string const key(p + 1, e);
-                if (key == "city") out += city;
-                else if (key == "zone") out += zone;
+                auto pick = [](std::vector<std::string> const& v, std::size_t i, char const* fallback)
+                { return i < v.size() && !v[i].empty() ? v[i] : std::string(fallback); };
+                if (key == "city") out += ctx.city;
+                else if (key == "zone") out += ctx.zone;
+                else if (key == "weather") out += ctx.weather;
+                else if (key == "race") out += ctx.race;
+                else if (key == "home") out += ctx.home;
+                else if (key == "enemy") out += ctx.enemy;
+                else if (key == "leader") out += ctx.leader;
                 else if (key.size() == 1 && key[0] >= '0' && key[0] <= '2')
-                {
-                    std::size_t const i = std::size_t(key[0] - '0');
-                    out += i < names.size() ? names[i] : std::string("friend");
-                }
+                    out += pick(ctx.names, std::size_t(key[0] - '0'), "friend");
+                else if (key.size() == 2 && key[0] == 'r' && key[1] >= '0' && key[1] <= '2')
+                    out += pick(ctx.races, std::size_t(key[1] - '0'), "traveller");
+                else if (key.size() == 2 && key[0] == 'h' && key[1] >= '0' && key[1] <= '2')
+                    out += pick(ctx.homes, std::size_t(key[1] - '0'), "far away");
                 p = e;
                 continue;
             }
@@ -292,6 +333,15 @@ inline std::string Fill(char const* text, std::string const& city, std::string c
         out += *p;
     }
     return out;
+}
+
+inline std::string Fill(char const* text, std::string const& city, std::string const& zone, std::vector<std::string> const& names)
+{
+    FillCtx ctx;
+    ctx.city = city;
+    ctx.zone = zone;
+    ctx.names = names;
+    return Fill(text, ctx);
 }
 
 // The pause before the next line, from the length of the one just said: time to read it, then type a reply. In [kLineMinMs, kLineMaxMs].
@@ -309,6 +359,258 @@ inline char const* const kTopics[] = {
     "joining a guild", "the enemy faction raiding a town", "fishing", "an annoying quest with a bad drop rate", "old war stories",
 };
 constexpr std::size_t kTopicCount = sizeof(kTopics) / sizeof(kTopics[0]);
+
+// ---- Role-play talk (Playerbot.World.Gathering.TalkStyle = rp) -----------------------------------------------------------------------
+// The same machinery with the bots speaking in character, as people of Azeroth instead of players talking about the game. A TalkEnv
+// (what the ring actually has: the zone's weather, nightfall, the talkers' races) gates the rp scripts; the race ids are SharedDefines'
+// RACE_* restated so this header stays pure.
+
+constexpr std::uint8_t kRaceHuman = 1, kRaceOrc = 2, kRaceDwarf = 3, kRaceNightElf = 4, kRaceUndead = 5, kRaceTauren = 6,
+                       kRaceGnome = 7, kRaceTroll = 8;
+
+struct TalkEnv
+{
+    std::uint8_t weather = kWeatherAny;   // the zone's weather right now, a kWeather* category (never kWeatherBad)
+    bool night = false;                   // the realm's clock says night (the same hours the chat bridge reports)
+    std::uint32_t race_mask = 0;          // 1u << race, for each talker
+};
+
+// The racial capital a {home} / {h0}..{h2} placeholder fills in.
+inline char const* RaceHome(std::uint8_t race)
+{
+    switch (race)
+    {
+        case kRaceHuman:    return "Stormwind";
+        case kRaceOrc:      return "Orgrimmar";
+        case kRaceDwarf:    return "Ironforge";
+        case kRaceNightElf: return "Darnassus";
+        case kRaceUndead:   return "the Undercity";
+        case kRaceTauren:   return "Thunder Bluff";
+        case kRaceGnome:    return "Gnomeregan";
+        case kRaceTroll:    return "Sen'jin Village";
+        default:            return "";
+    }
+}
+
+// Who a {leader} placeholder names.
+inline char const* RaceLeader(std::uint8_t race)
+{
+    switch (race)
+    {
+        case kRaceHuman:    return "the King";
+        case kRaceOrc:      return "Thrall";
+        case kRaceDwarf:    return "Magni";
+        case kRaceNightElf: return "Tyrande";
+        case kRaceUndead:   return "the Dark Lady";
+        case kRaceTauren:   return "Cairne";
+        case kRaceGnome:    return "Mekkatorque";
+        case kRaceTroll:    return "Vol'jin";
+        default:            return "";
+    }
+}
+
+// The word a kWeather* category fills {weather} with ("" when there's nothing to talk about).
+inline char const* WeatherCatWord(std::uint8_t cat)
+{
+    switch (cat)
+    {
+        case kWeatherRain: return "rain";
+        case kWeatherSnow: return "snow";
+        case kWeatherSand: return "sandstorm";
+        case kWeatherFog:  return "fog";
+        default:           return "";
+    }
+}
+
+// The in-character scripts: same shape as Scripts(), plus the optional gates on Script (weather / a required race / night only).
+// A race-gated script may address that talker as {1} - the driver seats a talker of the required race at slot 1. {enemy} is the side
+// the ring is not on ("the Alliance" at a Horde gate, "the Horde" at an Alliance one).
+inline std::vector<Script> const& RpScripts()
+{
+    static std::vector<Script> const s = {
+        // ---- either side ----
+        { 0, 2, { { 0, "the road's been kind to no one this week", kTalk },
+                  { 1, "roads never are. rest while you can", kYes } } },
+        { 0, 2, { { 0, "this {weather} won't let up", kNo },
+                  { 1, "good for the fields, bad for the feet", kTalk },
+                  { 0, "and worse for the boots", kLaugh } },
+          kWeatherBad },
+        { 0, 2, { { 0, "rain on the road, rain in the pack", kNo },
+                  { 1, "the sky doesn't hate you. it rains on everyone", kLaugh } },
+          kWeatherRain },
+        { 0, 2, { { 0, "can't see the far side of the fire in this fog", kNo },
+                  { 1, "can't see my own boots", kLaugh } },
+          kWeatherFog },
+        { 0, 2, { { 1, "snow. proper weather, like {home}", kYes },
+                  { 0, "you would say that", kLaugh } },
+          kWeatherSnow, kRaceDwarf },
+        { 0, 2, { { 0, "the stars are out over {zone}", kPoint },
+                  { 1, "first clear night in a while", kYes } },
+          kWeatherAny, 0, true },
+        { 0, 3, { { 0, "I marched in the last war, you know", kTalk },
+                  { 1, "who didn't?", kQuestion },
+                  { 0, "the young ones. lucky them", kTalk } } },
+        { 0, 2, { { 0, "they say a dragon nests in the steppes again", kTalk },
+                  { 1, "they say that every winter", kLaugh },
+                  { 0, "one winter they'll be right", kPoint } } },
+        { 0, 3, { { 0, "haunch of boar, stale bread, water that tastes of the skin", kNo },
+                  { 1, "the road's menu", kTalk },
+                  { 2, "I'd kill for a tavern table", kLaugh } } },
+        { 0, 2, { { 0, "grain's dear this season", kTalk },
+                  { 1, "war's not good for prices", kNo },
+                  { 0, "war's good for selling swords", kYes } } },
+        { 0, 2, { { 0, "my leg aches whenever {weather} rolls in", kTalk },
+                  { 1, "your leg predicts the sky now", kLaugh },
+                  { 0, "better than the town crier", kYes } },
+          kWeatherBad },
+        { 0, 2, { { 0, "the quarry pays in silver and dust", kTalk },
+                  { 1, "and the dust's the part that keeps", kLaugh } } },
+        { 0, 2, { { 0, "{enemy} patrols the border roads again", kExclaim },
+                  { 1, "they want what we have. same as always", kNo } } },
+        { 0, 2, { { 0, "you're a long way from {h1}, {1}", kTalk },
+                  { 1, "I go where the work is", kTalk } } },
+        // ---- Alliance ----
+        { 1, 2, { { 0, "the Defias took another farm in Westfall", kExclaim },
+                  { 1, "and the Guard?", kQuestion },
+                  { 0, "the Guard watches the roads to {city}. the farms fend alone", kNo } } },
+        { 1, 3, { { 0, "my uncle rebuilt {city} after the war. still waiting on his pay", kTalk },
+                  { 1, "the Stonemasons' grievance. no wonder some turned bandit", kNo },
+                  { 0, "turned Defias, you mean", kTalk } } },
+        { 1, 3, { { 0, "any word of the King?", kQuestion },
+                  { 1, "still missing. Fordragon holds the throne for the boy", kTalk },
+                  { 2, "and the nobles hold Fordragon", kNo } } },
+        { 1, 2, { { 0, "they say the Brotherhood answers to someone inside the Keep", kTalk },
+                  { 1, "keep that whisper low. the Stockade's full of men who talked too loud", kNo } } },
+        { 1, 3, { { 0, "another wagon of Westfall folk came through the gates today", kTalk },
+                  { 1, "the fields fail, the bandits ride, and {city} sends prayers", kNo },
+                  { 2, "prayers don't fill bowls", kTalk } } },
+        { 1, 2, { { 0, "gnolls on the farms again. kobolds in the mines", kExclaim },
+                  { 1, "{zone} was quieter when the watch kept the roads", kNo } } },
+        { 1, 3, { { 0, "Light keep you, friends", kBow },
+                  { 1, "and you", kBow },
+                  { 2, "and keep my boots dry", kLaugh } } },
+        { 1, 2, { { 0, "the Horde pushed at Southshore again, they say", kTalk },
+                  { 1, "the border towns bleed so {city} sleeps", kNo } } },
+        { 1, 2, { { 1, "this {city} ale is thin as creek water", kNo },
+                  { 0, "you're spoiled, friend", kLaugh },
+                  { 1, "I'm a dwarf. I'm exact", kPoint } },
+          kWeatherAny, kRaceDwarf },
+        { 1, 2, { { 0, "how do you bear our short years, {1}?", kQuestion },
+                  { 1, "I've seen forests grow. a passing war is a season", kTalk } },
+          kWeatherAny, kRaceNightElf },
+        { 1, 3, { { 1, "we'll take Gnomeregan back one day", kCheer },
+                  { 0, "and the troggs will simply leave, will they", kLaugh },
+                  { 1, "with enough explosives, anything leaves", kPoint } },
+          kWeatherAny, kRaceGnome },
+        // ---- Horde ----
+        { 2, 3, { { 0, "{enemy} hit the Crossroads again", kExclaim },
+                  { 1, "every week now", kNo },
+                  { 0, "we answer, or the Barrens is theirs", kTalk } } },
+        { 2, 2, { { 0, "the humans sharpen knives in Southshore", kTalk },
+                  { 1, "Tarren Mill holds. it always holds", kYes } } },
+        { 2, 2, { { 0, "my father died in the camps the humans kept", kTalk },
+                  { 1, "the old ones remember, so the young don't have to", kBow } } },
+        { 2, 3, { { 0, "the elves still bleed the Warsong in Ashenvale", kTalk },
+                  { 1, "and the Warsong still sing", kCheer },
+                  { 2, "sing and bleed", kLaugh } } },
+        { 2, 3, { { 0, "Thrall says we build now, not burn", kTalk },
+                  { 1, "and if {enemy} burns first?", kQuestion },
+                  { 0, "then we answer like always", kPoint } } },
+        { 2, 3, { { 1, "the Earthmother watch your steps, friends", kBow },
+                  { 0, "and yours", kBow },
+                  { 1, "she watches the roads too. safer that way", kYes } },
+          kWeatherAny, kRaceTauren },
+        { 2, 2, { { 1, "I walked Lordaeron before the plague took it", kTalk },
+                  { 0, "and now?", kQuestion },
+                  { 1, "now the Dark Lady points, and I walk", kTalk } },
+          kWeatherAny, kRaceUndead },
+        { 2, 2, { { 1, "an axe is honest work. war was honest too", kTalk },
+                  { 0, "Durotar teaches patience", kTalk },
+                  { 1, "Durotar teaches thirst", kLaugh } },
+          kWeatherAny, kRaceOrc },
+        { 2, 2, { { 1, "the jungle calls, mon. this dust is no home", kTalk },
+                  { 0, "Sen'jin's not far", kTalk },
+                  { 1, "not far, not home", kNo } },
+          kWeatherAny, kRaceTroll },
+    };
+    return s;
+}
+
+// The rp scripts a ring of `talkers` on this side can say under `env` (weather / night / the races present); `street` keeps outdoor
+// lines out of the city.
+inline std::vector<std::size_t> RpScriptsFor(bool alliance, std::size_t talkers, bool street, TalkEnv const& env)
+{
+    std::vector<std::size_t> out;
+    auto const& all = RpScripts();
+    for (std::size_t i = 0; i < all.size(); ++i)
+    {
+        Script const& s = all[i];
+        if (s.talkers > talkers) continue;
+        if (s.faction != 0 && s.faction != (alliance ? 1u : 2u)) continue;
+        if (street && OutdoorScript(s)) continue;
+        if (s.weather != kWeatherAny && s.weather != env.weather && !(s.weather == kWeatherBad && env.weather != kWeatherAny)) continue;
+        if (s.night && !env.night) continue;
+        if (s.race && !(env.race_mask & (std::uint32_t(1) << s.race))) continue;
+        out.push_back(i);
+    }
+    return out;
+}
+
+// In-character topics for the chat model, one per conversation: the shared set, then the side's own.
+inline char const* const kRpTopics[] = {
+    "the war between the Alliance and the Horde", "a town the enemy raided not long ago", "the road you travelled to get here",
+    "what you miss about home", "a rumour of dragons in the south", "the fallen kingdoms of the north",
+    "work, coin and the price of armour", "the cold nights on the road", "old war stories",
+    "what the guards won't talk about", "the markets and the price of bread", "strange lights over the hills at night",
+};
+constexpr std::size_t kRpTopicCount = sizeof(kRpTopics) / sizeof(kRpTopics[0]);
+inline char const* const kRpTopicsAlliance[] = {
+    "the Defias Brotherhood tightening its hold on Westfall", "the missing king and the nobles who rule Stormwind",
+    "the Stonemasons who rebuilt the city and were never paid", "gnolls and kobolds pressing into Elwynn",
+    "the Horde raiding across the border",
+};
+inline char const* const kRpTopicsHorde[] = {
+    "the Alliance pushing into the Barrens", "the internment camps the old ones still speak of",
+    "the elves holding Ashenvale against the Warsong", "Tarren Mill standing against Southshore",
+    "the Warchief's peace and whether it can last",
+};
+inline std::size_t RpTopicCount(bool alliance)
+{
+    return kRpTopicCount + (alliance ? sizeof(kRpTopicsAlliance) : sizeof(kRpTopicsHorde)) / sizeof(char const*);
+}
+inline char const* RpTopic(bool alliance, std::size_t i)
+{
+    if (i < kRpTopicCount)
+        return kRpTopics[i];
+    i -= kRpTopicCount;
+    return alliance ? kRpTopicsAlliance[i % (sizeof(kRpTopicsAlliance) / sizeof(char const*))]
+                    : kRpTopicsHorde[i % (sizeof(kRpTopicsHorde) / sizeof(char const*))];
+}
+inline char const* const kRpStreetTopics[] = {
+    "the market prices and what a meal costs", "the city watch and who they really serve", "rumours from the border towns",
+    "the last caravan through the gates", "who owns half the shops in this city", "the war and what it costs folk",
+};
+constexpr std::size_t kRpStreetTopicCount = sizeof(kRpStreetTopics) / sizeof(kRpStreetTopics[0]);
+inline char const* const kRpStreetTopicsAlliance[] = {
+    "Westfall's refugees begging in the streets", "the King's disappearance and who really rules", "the Stockade riots",
+    "the Defias moving closer to the city",
+};
+inline char const* const kRpStreetTopicsHorde[] = {
+    "the zeppelin fares and who pockets them", "the Alliance spies they say are in the city",
+    "the internment camps in living memory", "the warbands riding for the border",
+};
+inline std::size_t RpStreetTopicCount(bool alliance)
+{
+    return kRpStreetTopicCount + (alliance ? sizeof(kRpStreetTopicsAlliance) : sizeof(kRpStreetTopicsHorde)) / sizeof(char const*);
+}
+inline char const* RpStreetTopic(bool alliance, std::size_t i)
+{
+    if (i < kRpStreetTopicCount)
+        return kRpStreetTopics[i];
+    i -= kRpStreetTopicCount;
+    return alliance ? kRpStreetTopicsAlliance[i % (sizeof(kRpStreetTopicsAlliance) / sizeof(char const*))]
+                    : kRpStreetTopicsHorde[i % (sizeof(kRpStreetTopicsHorde) / sizeof(char const*))];
+}
 
 // ---- The board the idle rule reads ------------------------------------------------------------------------------------------------
 

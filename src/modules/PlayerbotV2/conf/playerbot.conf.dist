@@ -481,6 +481,10 @@ Playerbot.World.Gathering.ChatModelPerMinute = 4
 # gatherings' own (chat model or bot bridge, ChatModelPerMinute shared, else the written talks that fit a city street). A chat lasts
 # 3 to 6 minutes, then they go on with their day and others may start one. CityChats = how many at once in one city, 0 = none.
 Playerbot.World.Gathering.CityChats = 3
+# TalkStyle = rp: the bots speak in character, as people of Azeroth (their race and homeland, the war, the zone's weather, the Defias
+# outside Stormwind) instead of players chatting about the game - the written talks come from a role-play set gated on the talkers'
+# races, the weather and the time of day, and the chat model / bot bridge is asked for in-character lines the same way.
+Playerbot.World.Gathering.TalkStyle = players
 
 # How many other players may stand within 40 yards of a world bot working a quest objective before it gives that objective up for 15
 # minutes and takes another quest (real players and their companions keep their place first, then world bots by id). Keeps a popular mob

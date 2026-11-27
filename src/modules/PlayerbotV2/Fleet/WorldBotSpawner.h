@@ -327,9 +327,9 @@ private:
         ObjectGuid fire;
         uint32 fire_try_ms = 0;
         // The talk: a script (script >= 0) or the chat model (model), the bots taking part, when the next line is due.
-        int32  script = -1;
+        int32  script = -1;               // index into the table `rp` names (a conf reload mid-talk must not swap tables)
         uint32 line = 0, next_line_ms = 0, turns_left = 0, topic = 0, asked_ms = 0;
-        bool   model = false, waiting = false;
+        bool   model = false, waiting = false, rp = false;
         std::vector<uint64> talkers;
         std::string chat;
         uint64 key = 0;

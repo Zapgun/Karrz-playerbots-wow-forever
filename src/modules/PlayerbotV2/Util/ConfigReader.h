@@ -548,6 +548,7 @@ public:
         bool   use_chat_model  = true;
         uint32 model_per_minute = 4;
         uint32 city_chats      = 3;      // street chats at once in one capital, where a real player walks (0 = none)
+        bool   rp_talk         = false;  // TalkStyle = rp: in-character talk (Gathering.h's RpScripts / rp topics and prompt)
     };
     GatheringConfig const& gathering() const { return gathering_; }
     bool behavior_quest_accept()        const { return bhv_quest_accept_; }
