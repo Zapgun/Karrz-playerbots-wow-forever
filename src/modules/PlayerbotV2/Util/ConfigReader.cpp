@@ -249,6 +249,7 @@ void ConfigReader::apply_from_loaded_config()
         m.whispers          = c.GetBoolDefault("Playerbot.ChatModel.Whispers", true, true);
         m.party             = c.GetBoolDefault("Playerbot.ChatModel.Party", true, true);
         m.say_reply         = c.GetBoolDefault("Playerbot.ChatModel.Say", true, true);
+        m.guild             = c.GetBoolDefault("Playerbot.ChatModel.Guild", true, true);
         m.host              = c.GetStringDefault("Playerbot.ChatModel.Host", "127.0.0.1", true);
         m.port              = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.Port", 11434, true), 1, 65535));
         m.model             = c.GetStringDefault("Playerbot.ChatModel.Model", "llama3.2:3b", true);
@@ -266,6 +267,10 @@ void ConfigReader::apply_from_loaded_config()
         m.date_in_prompt    = c.GetBoolDefault("Playerbot.ChatModel.DateInPrompt", true, true);
         m.bot_cooldown_ms   = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.BotCooldownMs", 3000, true), 0, 600000));
         m.group_cooldown_ms = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.GroupCooldownMs", 0, true), 0, 600000));
+        m.guild_cooldown_ms = uint32(std::clamp<float>(c.GetFloatDefault("Playerbot.ChatModel.GuildCooldownSec", 15.0f, true), 0.0f, 600.0f) * 1000.0f);
+        m.guild_chain_chance = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.GuildChainChance", 65, true), 0, 100));
+        m.guild_chain_window_ms = uint32(std::clamp<float>(c.GetFloatDefault("Playerbot.ChatModel.GuildChainWindowSec", 75.0f, true), 0.0f, 600.0f) * 1000.0f);
+        m.guild_banter_ms   = uint32(std::clamp<float>(c.GetFloatDefault("Playerbot.ChatModel.GuildBanterSec", 120.0f, true), 0.0f, 3600.0f) * 1000.0f);
         m.max_per_minute    = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.MaxPerMinute", 30, true), 1, 600));
         m.max_queue         = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.MaxQueue", 6, true), 1, 64));
         m.max_wait_ms       = uint32(std::clamp<int32>(c.GetIntDefault("Playerbot.ChatModel.MaxWaitMs", 60000, true), 2000, 300000));

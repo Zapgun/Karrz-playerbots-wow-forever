@@ -3,6 +3,7 @@
 #include "BotBridge.h"
 #include "BotAI.h"
 #include "BotBridgeFormat.h"
+#include "BotChatReactor.h"
 #include "BotCommandParser.h"
 #include "BotIntent.h"
 #include "BotIntentEmitter.h"
@@ -37,6 +38,7 @@
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
 #include "Group.h"
+#include "Guild.h"
 #include "Item.h"
 #include "Log.h"
 #include "Map.h"
@@ -60,6 +62,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <ctime>
 #include <condition_variable>
@@ -545,8 +548,111 @@ void ReadReplies(ConfigReader::BridgeConfig const& cfg, uint32 now_ms)
 
 // delay_ms: the program's typing time for this line (it no longer waits before it writes the reply, so an action in the same
 // reply happens at once and only the text waits); -1 when the program did not send one: a short typing time of our own.
+// A model that saw its own "bot" name sometimes introduces itself ("hi, i'm phinarina, ready for raids") — a
+// guildmate never does: the channel knows who is typing. Strip a leading self-introduction; a line that was
+// only an intro is dropped.
+std::string StripSelfIntro(std::string text, std::string const& name)
+{
+    if (name.empty() || text.empty())
+        return text;
+    std::string low = text, lname = name;
+    std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    std::transform(lname.begin(), lname.end(), lname.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    std::size_t const pos = low.find(lname);
+    if (pos == std::string::npos)
+        return text;
+    static char const* kIntros[] = { "i'm ", "i am ", "it's ", "its ", "this is ", "the name's ", "name's ",
+                                     "my name is ", "my name's ", "it's me, ", "it's me " };
+    std::size_t cut = std::string::npos;
+    if (pos <= 24)   // an introduction lives at the front of a line; a name further in is self-address, stripped below
+        for (char const* iw : kIntros)
+            if (std::size_t p = low.rfind(iw, pos); p != std::string::npos && p + strlen(iw) == pos)
+            {
+                cut = pos + lname.size();   // erase from the intro word through the name, keep what led up to it ("hi, ")
+                while (cut < text.size() && (text[cut] == ' ' || text[cut] == ',' || text[cut] == '!' || text[cut] == ':'))
+                    ++cut;
+                text.erase(p, cut - p);
+                break;
+            }
+    if (cut == std::string::npos)
+    {
+        if (pos != 0)
+        {
+            // A self-address later in the line ("hey <name>!! let's ...") — the model mistook its own "bot"
+            // field for who to greet. A bot never says its own name: take the word out wherever it stands,
+            // with the separators that hung on it, and collapse what's left back together.
+            low = text;
+            std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+            for (std::size_t at = 0; (at = low.find(lname, at)) != std::string::npos;)
+            {
+                bool const left_ok = at == 0 || !std::isalnum(static_cast<unsigned char>(low[at - 1]));
+                std::size_t end = at + lname.size();
+                if (end + 2 <= low.size() && low.compare(end, 2, "'s") == 0)
+                    end += 2;   // "<name>'s" goes out whole
+                bool const right_ok = end >= low.size() || !std::isalnum(static_cast<unsigned char>(low[end]));
+                if (!left_ok || !right_ok) { ++at; continue; }   // a longer word it sits inside — not the name
+                while (end < text.size() && (text[end] == ' ' || text[end] == ',' || text[end] == '!' ||
+                                             text[end] == ':' || text[end] == ';'))
+                    ++end;
+                text.erase(at, end - at);
+                low.erase(at, end - at);
+            }
+            while (text.find("  ") != std::string::npos)
+            {
+                auto p2 = text.find("  ");
+                text.erase(p2, 1);
+            }
+            while (!text.empty() && (text.front() == ' ' || text.front() == ',' || text.front() == '!' ||
+                                     text.front() == ':' || text.front() == ';'))
+                text.erase(0, 1);
+            while (!text.empty() && (text.back() == ' ' || text.back() == ','))
+                text.pop_back();
+            std::string rem0 = text;
+            std::transform(rem0.begin(), rem0.end(), rem0.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+            while (!rem0.empty() && (rem0.back() == '!' || rem0.back() == '.'))
+                rem0.pop_back();
+            // An intro filler can be left dangling after the name went out ("..., vigdis here" -> "..., here").
+            static char const* kTrailers[] = { ", here", ", back", ", online", ", present", ", checking in" };
+            for (char const* t : kTrailers)
+                if (std::size_t const n = strlen(t); rem0.size() > n && rem0.compare(rem0.size() - n, n, t) == 0)
+                {
+                    text.erase(rem0.size() - n);   // takes the trailer and any trailing punctuation with it
+                    rem0.erase(rem0.size() - n);
+                    break;
+                }
+            if (rem0.empty() || rem0 == "hey" || rem0 == "hi" || rem0 == "hello" || rem0 == "hey there")
+                return {};   // the line was only the greeting to itself
+            if (std::islower(static_cast<unsigned char>(text.front())))
+                text.front() = char(std::toupper(static_cast<unsigned char>(text.front())));
+            return text;
+        }
+        cut = lname.size();
+        while (cut < text.size() && (text[cut] == ' ' || text[cut] == ',' || text[cut] == '!' || text[cut] == ':'))
+            ++cut;
+        text.erase(0, cut);
+    }
+    std::string rem = text;
+    std::transform(rem.begin(), rem.end(), rem.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    while (!rem.empty() && (rem.back() == '!' || rem.back() == '.'))
+        rem.pop_back();
+    if (rem.empty() || rem == "here" || rem == "back" || rem == "online" || rem == "checking in")
+        return {};   // the whole line was the introduction
+    if (std::islower(static_cast<unsigned char>(text.front())))
+        text.front() = char(std::toupper(static_cast<unsigned char>(text.front())));
+    return text;
+}
+
 void Say(BotId bot, std::string const& channel, std::string const& to, std::string text, uint32 now_ms, int32 delay_ms)
 {
+    Player* p = FindBot(bot);
+    std::string const name = p ? p->GetName() : std::string();
+    text = StripSelfIntro(std::move(text), name);
+    if (text.empty())
+    {
+        TC_LOG_INFO("playerbot.v2", "[bridge] {} {}: line dropped (was only a self-introduction)", channel, name);
+        return;
+    }
+    TC_LOG_INFO("playerbot.v2", "[bridge] {} {}: \"{}\"", channel, name, text);
     uint32 const typing_ms = delay_ms >= 0 ? uint32(delay_ms) : std::min<uint32>(uint32(text.size()) * 30u, 2500u);
     Intent it{};
     it.bot_id = bot;
@@ -556,6 +662,8 @@ void Say(BotId bot, std::string const& channel, std::string const& to, std::stri
         it.body = ChatIntent{PartyChatIntent{std::move(text)}};
     else if (channel == "raid")
         it.body = ChatIntent{RaidChatIntent{std::move(text)}};
+    else if (channel == "guild")
+        it.body = ChatIntent{GuildChatIntent{std::move(text)}};
     else if (channel == "yell")
         it.body = ChatIntent{YellChatIntent{std::move(text)}};
     else if (channel == "general" || channel == "trade")
@@ -2074,11 +2182,44 @@ std::string CarryText(Player* bot)
 // BotChatter decides WHEN a bot speaks (its chance and cooldowns, unchanged); with a program answering chat it hands the moment
 // here instead of saying a fixed line, and the program writes WHAT the bot says. Queued from any thread (bot workers, map
 // threads), written on the world thread.
-struct Moment { BotId bot = 0; std::string what, detail, example; uint32 queued_ms = 0; };
+struct Moment { BotId bot = 0; std::string what, detail, example, channel; uint32 queued_ms = 0; };
 std::atomic<bool>   g_moments_on{false};
 std::mutex          g_moment_mtx;
 std::vector<Moment> g_moments;          // g_moment_mtx
 std::deque<uint32>  g_moment_minute;    // g_moment_mtx: when the moments of the last minute were queued
+
+// The recent lines of each guild's chat: last 8 said in the last 5 minutes, fed by NoteGuildChat from
+// Module::OnGuildChat, sent as `chat_log` on guild chat_in and moment events — the program sees the
+// conversation (who said what, bots marked), not one isolated line, so it knows the next speaker is
+// not the same person.
+struct ChatLogLine { std::string from; std::string text; bool bot; uint32 ms; };
+std::unordered_map<uint64, std::deque<ChatLogLine>> g_chat_log;   // g_moment_mtx
+
+// A bot's /g line queued by the executor until Update can hand it to the guild reactor on the world thread
+// (the line itself never reaches Module::OnGuildChat — that hook sees real-player packets only).
+struct PendingGuildChat { BotId bot; uint64 guild_id; std::string text; };
+std::deque<PendingGuildChat> g_pending_guild_chat;   // g_moment_mtx
+
+// The guild's recent lines as a JSON array, oldest first: [{"from":"Tagrin","bot":0,"text":"..."}, ...].
+std::string ChatLogJson(uint64 guild_id)
+{
+    std::lock_guard<std::mutex> lk(g_moment_mtx);
+    auto it = g_chat_log.find(guild_id);
+    if (it == g_chat_log.end())
+        return "[]";
+    std::string j = "[";
+    bool first = true;
+    for (ChatLogLine const& l : it->second)
+    {
+        if (!first)
+            j += ',';
+        j += "{\"from\":\"" + Bridge::JsonEscape(l.from) + "\",\"bot\":" + std::string(l.bot ? "1" : "0") +
+             ",\"text\":\"" + Bridge::JsonEscape(l.text) + "\"}";
+        first = false;
+    }
+    j += "]";
+    return j;
+}
 
 // The real player a bot's party line is for: its owner when he is in the group, else the first real player in the group.
 Player* MomentListener(Player* bot)
@@ -2099,6 +2240,25 @@ Player* MomentListener(Player* bot)
             first = m;
     }
     return first;
+}
+
+// The real player in the bot's guild who reads the line: any online guild member that is not a bot. A guild moment is dropped
+// without one — a line nobody reads is not worth a model call (the caller also checks before queueing).
+Player* GuildMomentListener(Player* bot)
+{
+    Guild* g = bot->GetGuild();
+    if (!g)
+        return nullptr;
+    for (auto const& [mguid, member] : g->GetMembers())
+    {
+        if (!member.IsOnline())
+            continue;
+        Player* m = ObjectAccessor::FindConnectedPlayer(mguid);
+        if (!m || m == bot || !m->GetSession() || m->GetSession()->IsBot())
+            continue;
+        return m;
+    }
+    return nullptr;
 }
 
 // The language a player reads the bots in ("ruRU", "enUS"): his `.bot language` choice, else his game client's
@@ -2146,12 +2306,13 @@ void WriteMoment(ConfigReader::BridgeConfig const& cfg, Moment const& m, uint32 
     Player* bot = FindBot(m.bot);
     if (!bot || !bot->IsInWorld())
         return;
-    Player* to = MomentListener(bot);
+    bool const guild = m.channel == "guild";
+    Player* to = guild ? GuildMomentListener(bot) : MomentListener(bot);
     if (!to)
         return;
     // A raid of more than 15 hears its bots in raid chat (Bot/Raid/RaidVoice.h): party chat there reaches only the bot's sub-group.
     Group const* group = bot->GetGroup();
-    char const* const channel = group && group->GetMembersCount() > Raid::kRaidVoiceGroupSize ? "raid" : "party";
+    char const* const channel = guild ? "guild" : (group && group->GetMembersCount() > Raid::kRaidVoiceGroupSize ? "raid" : "party");
     Event e;
     e.type = "moment";
     FillBot(e, bot, 0);
@@ -2160,10 +2321,17 @@ void WriteMoment(ConfigReader::BridgeConfig const& cfg, Moment const& m, uint32 
     if (!m.example.empty())
         e.fields.emplace_back("example", m.example);
     e.fields.emplace_back("channel", channel);
-    e.fields.emplace_back("to", to->GetName());
+    if (!guild)
+    {
+        // A guild line is ambient: the listener is an audience, not an addressee — naming him invites the program
+        // to address him every time. A directed moment names its target in `detail` (the join welcome does).
+        e.fields.emplace_back("to", to->GetName());
+        bool const owned = Services::Owners().GetOwner(m.bot).account_id != 0;
+        e.numbers.emplace_back("to_is_owner", owned && OwnsBot(to, m.bot) ? 1 : 0);
+    }
+    else
+        e.raw.emplace_back("chat_log", ChatLogJson(bot->GetGuildId()));   // the recent /g lines it joins
     e.fields.emplace_back("locale", ClientLocale(to));
-    bool const owned = Services::Owners().GetOwner(m.bot).account_id != 0;
-    e.numbers.emplace_back("to_is_owner", owned && OwnsBot(to, m.bot) ? 1 : 0);
     if (cfg.actions)
     {
         // A moment may come with one action for the player it is said to (offer him a trade, wave), checked as for his own ask.
@@ -2518,13 +2686,58 @@ void SpeakUp(uint32 now_ms)
     }
 }
 
+// World thread (from Update): bot /g lines queued by the executor go to the guild reactor — a bot's line
+// can get an answer from a guildmate just like a real player's can.
+void DrainGuildBotChat()
+{
+    std::deque<PendingGuildChat> pending;
+    {
+        std::lock_guard<std::mutex> lk(g_moment_mtx);
+        pending.swap(g_pending_guild_chat);
+    }
+    for (PendingGuildChat const& p : pending)
+        if (Player* sender = FindBot(p.bot))
+            BotChatReactor::ReactGuildModel(sender, p.guild_id, p.text);
+}
+
 } // namespace
+
+void BotBridge::NoteGuildBotChat(BotId bot, uint64 guild_id, std::string text)
+{
+    if (!bot || !guild_id || text.empty())
+        return;
+    if (text.front() == ';' || text.front() == '.' || text.front() == '/')
+        return;   // command prefixes and addon traffic are not chat
+    std::lock_guard<std::mutex> lk(g_moment_mtx);
+    if (g_pending_guild_chat.size() >= 64)
+        g_pending_guild_chat.pop_front();
+    g_pending_guild_chat.push_back({ bot, guild_id, std::move(text) });
+}
+
+void BotBridge::NoteGuildChat(uint64 guild_id, std::string const& from, std::string const& text, bool from_bot)
+{
+    if (!guild_id || text.empty())
+        return;
+    if (text.front() == ';' || text.front() == '.' || text.front() == '/')
+        return;   // command prefixes and addon traffic are not chat — keep them out of the model's view of /g
+    uint32 const now_ms = GameTime::GetGameTimeMS();
+    std::lock_guard<std::mutex> lk(g_moment_mtx);
+    auto& log = g_chat_log[guild_id];
+    while (!log.empty() && now_ms - log.front().ms >= 5u * 60u * 1000u)
+        log.pop_front();
+    log.push_back({ from, text.size() > 200 ? text.substr(0, 200) : text, from_bot, now_ms });
+    if (log.size() > 8)
+        log.pop_front();
+    if (g_chat_log.size() > 64)   // bot-managed guilds are few; still bound the map for the odd private one
+        for (auto it = g_chat_log.begin(); it != g_chat_log.end();)
+            it = it->second.empty() || now_ms - it->second.back().ms >= 5u * 60u * 1000u ? g_chat_log.erase(it) : ++it;
+}
 
 bool BotBridge::Enabled() { return g_enabled.load(std::memory_order_relaxed); }
 
 bool BotBridge::MomentsOn() { return g_moments_on.load(std::memory_order_relaxed); }
 
-bool BotBridge::QueueMoment(BotId bot, std::string what, std::string detail, std::string example)
+bool BotBridge::QueueMoment(BotId bot, std::string what, std::string detail, std::string example, std::string channel)
 {
     if (!bot || !g_moments_on.load(std::memory_order_relaxed))
         return false;
@@ -2536,7 +2749,7 @@ bool BotBridge::QueueMoment(BotId bot, std::string what, std::string detail, std
     if (g_moment_minute.size() >= per_minute || g_moments.size() >= 32)
         return false;   // the model's time goes to players' chat first: this one gets the fixed line
     g_moment_minute.push_back(now_ms);
-    g_moments.push_back(Moment{ bot, std::move(what), std::move(detail), std::move(example), now_ms });
+    g_moments.push_back(Moment{ bot, std::move(what), std::move(detail), std::move(example), std::move(channel), now_ms });
     return true;
 }
 
@@ -2698,9 +2911,12 @@ uint64 BotBridge::ReportChat(Player* bot, Player* sender, std::string const& cha
         e.fields.emplace_back("group", names);
     }
     e.fields.emplace_back("from", sender->GetName());
+    e.fields.emplace_back("to", sender->GetName());   // the answer is said to the speaker — name them, not anyone else in the event
     e.fields.emplace_back("locale", ClientLocale(sender));
     e.numbers.emplace_back("from_is_bot", Services::Registry().has(sender->GetGUID().GetCounter()) ? 1 : 0);
     e.fields.emplace_back("text", text.size() > 500 ? text.substr(0, 500) : text);
+    if (channel == "guild")
+        e.raw.emplace_back("chat_log", ChatLogJson(bot->GetGuildId()));   // the recent /g lines this one joins
     if (Services::Config().bridge().prompt_in_chat && !prompt.empty())
         e.fields.emplace_back("prompt", prompt);
     uint32 const now_ms = GameTime::GetGameTimeMS();
@@ -2852,6 +3068,9 @@ void BotBridge::Update(uint32 now_ms)
     g_enabled = cfg.enable;
     g_moments_on = cfg.enable && g_started && g_client_alive && cfg.chat && cfg.moments && cfg.moments_per_minute > 0;
     g_talk_on = cfg.enable && g_started && g_client_alive && cfg.chat && cfg.talk && cfg.moments_per_minute > 0;
+    // Queued bot /g lines go to the guild reactor every tick, bridge on or off (GuildOn also covers the local
+    // chat model) — else they would pile up while the bridge is down and replay as fresh when it comes back.
+    DrainGuildBotChat();
     if (!cfg.enable)
     {
         if (g_started)

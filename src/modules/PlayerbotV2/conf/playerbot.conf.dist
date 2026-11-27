@@ -1645,6 +1645,8 @@ Playerbot.Chatter.BotCooldownMs   = 60000
 #   Say              1 = the model answers a /say that names a bot within /say range, or that the speaker says with a bot
 #                    targeted. Whispers, named party lines and these /say lines are answered whatever the bot's chattiness;
 #                    chattiness only keeps quiet bots out of unprompted party chat.
+#   Guild            1 = the model answers guild chat: a guild bot named in the line, else one officer answers on the same
+#                    per-guild cooldown as the keyword replies (whichever path is on owns the reply).
 #   Host / Port      the Ollama server (default 127.0.0.1:11434).
 #   Model            the Ollama model name.
 #   TimeoutMs        give up on one request after this long (default 45000).
@@ -1664,6 +1666,12 @@ Playerbot.Chatter.BotCooldownMs   = 60000
 #   DateInPrompt     1 = the bot knows the server's real date, time and time zone (for "what's the date?").
 #   BotCooldownMs    one bot asks the model at most this often (a whisper inside the gap gets the usual reply).
 #   GroupCooldownMs  gap between two unprompted party / raid answers in one group (default 0 = none).
+#   GuildCooldownSec after a bot answers a guild-chat line that was not aimed at it, the next such answer in the
+#                    same guild waits at least this many seconds, so a busy /g does not draw a bot reply to every
+#                    line. Only unprompted answers count: a line that names a bot, or continues a thread a bot
+#                    already answered, is always answered right away. In seconds, decimals allowed (default 15.0;
+#                    0 = every line may get an answer; 60 = the old one-answer-a-minute pace). Also paces the
+#                    built-in keyword reply when the model is off.
 #   MaxPerMinute     realm-wide requests per minute.
 #   MaxQueue         requests waiting at once; more are answered the usual way.
 #   MaxWaitMs        a reply that comes back later than this after the line is dropped.
@@ -1678,6 +1686,7 @@ Playerbot.ChatModel.Enable          = 0
 Playerbot.ChatModel.Whispers        = 1
 Playerbot.ChatModel.Party           = 1
 Playerbot.ChatModel.Say             = 1
+Playerbot.ChatModel.Guild           = 1
 Playerbot.ChatModel.Host            = "127.0.0.1"
 Playerbot.ChatModel.Port            = 11434
 Playerbot.ChatModel.Model           = "llama3.2:3b"
@@ -1695,6 +1704,15 @@ Playerbot.ChatModel.SayPerMinute    = 10
 Playerbot.ChatModel.DateInPrompt    = 1
 Playerbot.ChatModel.BotCooldownMs   = 3000
 Playerbot.ChatModel.GroupCooldownMs = 0
+Playerbot.ChatModel.GuildCooldownSec = 15.0
+# Guild banter cadence: GuildBanterSec is the per-guild spacing between ambient banter seeds (one bot makes small talk in /g
+# while a real member is online; 0 = off), GuildChainWindowSec is how long a burst of bot /g lines keeps a guild's banter
+# thread "hot", and GuildChainChance is the percent of bot lines inside that window that get answered (a line outside it
+# keeps the flat 35% and the GuildCooldownSec window). Raising these makes guild chat livelier; the reply still comes from
+# the chat model / bridge.
+Playerbot.ChatModel.GuildBanterSec   = 120
+Playerbot.ChatModel.GuildChainWindowSec = 75
+Playerbot.ChatModel.GuildChainChance = 65
 Playerbot.ChatModel.MaxPerMinute    = 30
 Playerbot.ChatModel.MaxQueue        = 6
 Playerbot.ChatModel.MaxWaitMs       = 60000
@@ -1706,8 +1724,9 @@ Playerbot.ChatModel.ExtraPrompt     = ""
 # Bot bridge (off by default): talks to an outside program on this PC through files, so a player can plug in their own chat
 # model, bug collector or tool without changing the server. Each realm has its own bridge; nothing is sent over the internet.
 # With Enable = 1 the server writes what happens to the bots, one JSON line per event, into Folder\events-YYYYMMDD-HH00.jsonl:
-#   chat_in     a whisper / party / raid / /say line a bot would answer (the same lines Playerbot.ChatModel answers, with its
-#               Whispers / Party / Say switches and limits); has "channel", "from", "text" and "prompt" (the bot description).
+#   chat_in     a whisper / party / raid / guild / /say line a bot would answer (the same lines Playerbot.ChatModel answers,
+#               with its Whispers / Party / Say / Guild switches and limits); has "channel", "from", "text" and "prompt"
+#               (the bot description).
 #   stuck       a bot asked to go somewhere for over 30 s without moving, so it dropped the goal.
 #   quest_fail  a bot dropped a quest it can never finish or turn in.
 #   spell_fail  the server refused the same spell SpellFailCount times in a minute ("reason" = the cast result number).
@@ -1717,8 +1736,8 @@ Playerbot.ChatModel.ExtraPrompt     = ""
 # Every bot event has the bot's name, guid, class, race, level, zone, area, map, position and quest (id and name).
 # The program answers by adding lines to Folder\replies.jsonl:
 #   {"reply_to":1042,"say":"Sure, on my way."}             answer chat_in 1042 on the channel it came from
-#   {"bot":"Brannor","say":"Anyone for Deadmines?","channel":"say"}   a line a bot says on its own (say, party, raid, yell, or
-#                                                           whisper with "to"); at most one every BotLineGapMs per bot
+#   {"bot":"Brannor","say":"Anyone for Deadmines?","channel":"say"}   a line a bot says on its own (say, party, raid, guild,
+#                                                           yell, or whisper with "to"); at most one every BotLineGapMs per bot
 #   {"ping":1}                                             nothing to say, the program is still running
 # Text only, unless Actions.Enable is on (below). Broken lines are skipped (one warning a minute).
 # Chat goes to the bridge only while the program has written to replies.jsonl in the last ClientTimeoutSec; otherwise bots answer

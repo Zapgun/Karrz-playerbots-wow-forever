@@ -28,13 +28,14 @@ class BotChatModel
 {
 public:
     // Say: a bot-to-bot gathering line (AskSay). SayReply: a bot answering a player's /say that addressed it. Each answer
-    // goes out on the channel it was asked on (whisper, party, raid, /say).
-    enum class Channel : uint8 { Whisper, Party, Say, SayReply, Raid };
+    // goes out on the channel it was asked on (whisper, party, raid, guild, /say).
+    enum class Channel : uint8 { Whisper, Party, Say, SayReply, Raid, Guild };
 
     // On in the config, and not resting after a failed request.
     static bool WhispersOn();
     static bool PartyOn();
     static bool SayReplyOn();
+    static bool GuildOn();
 
     // World thread. Queues `msg` from `sender` for `bot` to answer on `channel`; `ctx` describes the bot (BotChatReactor's
     // MakeConvContext). False when the request was not queued (off, cooling down, over the cap, queue full).

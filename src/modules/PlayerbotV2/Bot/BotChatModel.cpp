@@ -259,6 +259,9 @@ std::string BuildFacts(Player* bot, V2::ConversationContext const& ctx, BotChatM
         p += " " + ctx.sender_name + (ctx.knows_sender ? ", who is in your group," : ", a player you don't know,") + " whispers you.";
     else if (channel == BotChatModel::Channel::Raid)
         p += " You are in a raid group and " + ctx.sender_name + " says something in raid chat.";
+    else if (channel == BotChatModel::Channel::Guild)
+        p += " Several members may be talking in your guild's chat at once; " + ctx.sender_name +
+             " is the one speaking to you now — answer them, not everyone.";
     else
         p += " You are in a party and " + ctx.sender_name + " says something in party chat.";
     if (date)
@@ -318,6 +321,12 @@ bool BotChatModel::SayReplyOn()
 {
     auto const& c = Services::Config().chat_model();
     return c.say_reply && (BotBridge::ChatOn() || (c.enable && !IsDown()));
+}
+
+bool BotChatModel::GuildOn()
+{
+    auto const& c = Services::Config().chat_model();
+    return c.guild && (BotBridge::ChatOn() || (c.enable && !IsDown()));
 }
 
 bool BotChatModel::SayOn()
@@ -409,7 +418,7 @@ bool BotChatModel::Ask(Player* bot, Player* sender, V2::ConversationContext cons
     {
         // Same limits as the model above; the outside program answers in replies.jsonl and BotBridge says the answer.
         char const* const ch = channel == Channel::Whisper ? "whisper" : channel == Channel::Party ? "party"
-                             : channel == Channel::Raid ? "raid" : "say";
+                             : channel == Channel::Raid ? "raid" : channel == Channel::Guild ? "guild" : "say";
         // Only the facts: the program has its own rules for how to answer, the language and the bot's manner. This prompt's
         // rules went in as "facts" too, and its "say you don't know" won over them (GitHub #12).
         std::string prompt = BuildFacts(bot, ctx, channel, cfg.date_in_prompt);
@@ -541,6 +550,7 @@ void BotChatModel::DeliverReplies(uint32 now_ms)
         std::string const target = d.channel == Channel::Whisper ? "whisper to " + d.sender_name
                                  : d.channel == Channel::Party   ? std::string("party chat")
                                  : d.channel == Channel::Raid    ? std::string("raid chat")
+                                 : d.channel == Channel::Guild   ? std::string("guild chat")
                                                                  : std::string("/say");
         TC_LOG_INFO("playerbot.v2", "[conv] {} <- {} \"{}\": chat model ({} ms) -> {}: \"{}\"", d.bot_name, d.sender_name, d.question,
                     d.took_ms, target, d.answer);
@@ -566,6 +576,8 @@ void BotChatModel::DeliverReplies(uint32 now_ms)
             it.body = ChatIntent{WhisperIntent{std::move(d.sender_name), std::move(d.answer)}};
         else if (d.channel == Channel::Raid)
             it.body = ChatIntent{RaidChatIntent{std::move(d.answer)}};
+        else if (d.channel == Channel::Guild)
+            it.body = ChatIntent{GuildChatIntent{std::move(d.answer)}};
         else if (d.channel == Channel::Party)
             it.body = ChatIntent{PartyChatIntent{std::move(d.answer)}};
         else

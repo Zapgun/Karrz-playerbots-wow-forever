@@ -4202,8 +4202,13 @@ void Module::OnGuildChat(Player* sender, uint64 guild_id, std::string const& msg
 {
     // Phase C.3: route to BotChatReactor::ReactGuild. The reactor
     // handles all gating (per-guild throttle, bot-self filter, online-
-    // officer pick).
+    // officer pick). The model path (chat model or bridge) tries first;
+    // while it is on, the keyword reply below stays out of the way.
     if (!initialized_ || !sender || guild_id == 0 || msg.empty()) return;
+    // Every /g line — a real player's or a bot's — joins the guild's recent-lines log for the bridge's chat_log.
+    BotBridge::NoteGuildChat(guild_id, sender->GetName(), msg,
+                             sender->GetSession() && sender->GetSession()->IsBot());
+    BotChatReactor::ReactGuildModel(sender, guild_id, msg);
     BotChatReactor::ReactGuild(sender, guild_id, msg);
 }
 

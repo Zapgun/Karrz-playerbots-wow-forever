@@ -4417,6 +4417,11 @@ public:
     void   set_guild_chat_lfg_queue_entered_ms(uint32 ms) { guild_chat_lfg_queue_entered_ms_ = ms; }
     uint32 guild_chat_last_hangout_ms() const { return guild_chat_last_hangout_ms_; }
     void   note_guild_chat_hangout(uint32 ms) { guild_chat_last_hangout_ms_ = ms; }
+    //   guild_chat_last_banter_ms_ - per-bot cooldown on the guild banter pulse (GuildBanterSec): the
+    //     pulse picks a random eligible guild bot per guild slot, this stamp keeps one bot from taking
+    //     every turn.
+    uint32 guild_chat_last_banter_ms() const { return guild_chat_last_banter_ms_; }
+    void   note_guild_chat_banter(uint32 ms) { guild_chat_last_banter_ms_ = ms; }
     void   clear_guild_chat_state()
     {
         guild_chat_last_ding_level_  = 0;
@@ -4424,6 +4429,7 @@ public:
         guild_chat_last_smalltalk_ms_ = 0;
         guild_chat_last_brag_ms_      = 0;
         guild_chat_last_lfm_ms_       = 0;
+        guild_chat_last_banter_ms_    = 0;
     }
 private:
     ObjectGuid last_bag_buy_npc_;
@@ -4444,6 +4450,7 @@ private:
     uint16     guild_chat_last_seen_quest_count_ = 0xFFFF;  // 0xFFFF = unset (first-tick will stamp)
     uint32     guild_chat_lfg_queue_entered_ms_  = 0;       // 0 = not in queue
     uint32     guild_chat_last_hangout_ms_       = 0;       // ad-hoc tavern hangout proposer
+    uint32     guild_chat_last_banter_ms_        = 0;       // per-bot cooldown on the guild banter pulse
     // The five quest-memory maps below are accessed from TWO threads: the
     // snapshot builder (world thread) READS them, and State_Idle dispatch
     // (worker thread) WRITES them (and the builder also writes quest_impossible_

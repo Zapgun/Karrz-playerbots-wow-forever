@@ -62,7 +62,19 @@ public:
     // Any thread. Hands a moment to the program: `what` a short word (loot, level_up, wipe, boss_kill, ...), `detail` what happened
     // in plain words, `example` the fixed line the bot would have said (an idea for the program, may be empty). True: queued, the
     // caller says nothing itself. False (moments off, MomentsPerMinute reached): the caller says its fixed line as before.
-    static bool QueueMoment(BotId bot, std::string what, std::string detail, std::string example);
+    // `channel` "guild": the moment is for the bot's guild chat and the answer comes back there (someone real in the guild must
+    // be online or the moment is dropped — the caller checks before queueing). Empty: the bot's group (party, raid over 15).
+    static bool QueueMoment(BotId bot, std::string what, std::string detail, std::string example, std::string channel = {});
+
+    // Any thread (from Module::OnGuildChat). A line was said in this guild's chat — a real player or a bot, canned or written by
+    // the program: it joins the guild's recent-lines log (last 8 in the last 5 minutes), sent as `chat_log` on guild chat_in and
+    // moment events so the program sees the conversation, not an isolated line. Runs with the bridge off too — the log is free.
+    static void NoteGuildChat(uint64 guild_id, std::string const& from, std::string const& text, bool from_bot);
+
+    // Any thread (from the intent executor). A bot just said `text` in its guild chat: queue it so the guild reactor sees it on
+    // the world thread — bot /g lines never reach Module::OnGuildChat (a real-player packet hook), so without this feed bots
+    // could never answer each other's guild lines and /g stays a one-way stream of moments.
+    static void NoteGuildBotChat(BotId bot, uint64 guild_id, std::string text);
 
     // World bots talking with each other (Playerbot.Bridge.Talk): the program writes their lines. World thread.
     static bool TalkOn();

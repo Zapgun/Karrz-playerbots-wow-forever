@@ -3,6 +3,7 @@
 // PartyChatIntent through the per-bot intent queue.
 
 #include "BotChatReactor.h"
+#include "BotBridge.h"
 #include "BotChatModel.h"
 #include "BotConversation.h"
 #include "TownLife.h"
@@ -42,6 +43,7 @@
 #include "Player.h"
 #include "QuestDef.h"
 #include "World.h"        // sWorld locale + CONFIG_LISTEN_RANGE_* for say/yell
+#include <fmt/format.h>
 #include "WorldSession.h"
 #include "Containers.h"
 #include "GameTime.h"
@@ -1196,9 +1198,114 @@ void BotChatReactor::ReactWhisper(Player* sender, Player* bot, std::string const
 // the sender's guild and emits a contextual guild_chat reply through
 // the bot's intent queue. Per-guild throttle prevents reaction storms
 // when multiple players chat back-to-back.
+// Per-guild throttle (separate from per-bot to coexist with party chat): the gap between two unprompted guild
+// answers in one guild, Playerbot.ChatModel.GuildCooldownSec (0 = none). Shared by the keyword reply (ReactGuild)
+// and the model reply (ReactGuildModel) — whichever path is on uses the same window. Directed lines skip it.
+static std::mutex                            s_guild_react_mtx;
+static std::unordered_map<uint64, uint32_t>  s_last_guild_react_ms;
+// Last time any bot's /g line arrived in a guild (ReactGuildModel). A bot line inside GuildChainWindowSec
+// of the last one counts as a live banter thread: it counts as directed (skips the ambient GuildCooldownSec
+// window) and answers at GuildChainChance instead of the flat 35% isolated-bot-line chance, so an exchange
+// sustains instead of dying after a line or two.
+static std::unordered_map<uint64, uint32_t>  s_last_guild_banter_ms;
+
+// Recent normalized bot /g lines per guild — the repeat/loop breaker. The chat model falls into template
+// ping-pong ("hey Mimus, ..." / "hey Delmiran, ...") and every hop refreshes the banter window above, so
+// without this an A->B->A loop runs forever. Lines are normalized (lowercased, member names blanked,
+// whitespace collapsed) so addressee-swapped repeats compare equal.
+struct GuildRecentLine { std::string norm; uint32_t ms; };
+static std::unordered_map<uint64, std::deque<GuildRecentLine>> s_guild_recent_chat;
+constexpr size_t   kGuildRecentKeep     = 20;
+constexpr uint32_t kGuildRecentWindowMs = 3u * 60u * 1000u;
+
+std::string NormalizeGuildChat(std::string_view text, Guild* g)
+{
+    std::string norm(text);
+    for (char& c : norm)
+        c = char(std::tolower(static_cast<unsigned char>(c)));
+    if (g)
+    {
+        std::vector<std::string> names;
+        names.reserve(g->GetMembers().size());
+        for (auto const& entry : g->GetMembers())
+            if (entry.second.GetName().size() >= 3)
+            {
+                std::string n(entry.second.GetName());
+                for (char& c : n)
+                    c = char(std::tolower(static_cast<unsigned char>(c)));
+                names.push_back(std::move(n));
+            }
+        std::sort(names.begin(), names.end(),
+                  [](std::string const& a, std::string const& b) { return a.size() > b.size(); });
+        for (std::string const& n : names)
+        {
+            size_t pos = 0;
+            while ((pos = norm.find(n, pos)) != std::string::npos)
+            {
+                size_t end = pos + n.size();
+                bool left_ok  = pos == 0 || !std::isalpha(static_cast<unsigned char>(norm[pos - 1]));
+                bool right_ok = end >= norm.size() || !std::isalpha(static_cast<unsigned char>(norm[end]));
+                if (left_ok && right_ok)
+                {
+                    norm.replace(pos, n.size(), " ");
+                    ++pos;
+                }
+                else
+                    ++pos;
+            }
+        }
+    }
+    std::string out;
+    out.reserve(norm.size());
+    bool pending_space = false;
+    for (char c : norm)
+    {
+        if (std::isspace(static_cast<unsigned char>(c))) { pending_space = true; continue; }
+        if (pending_space && !out.empty())
+            out.push_back(' ');
+        pending_space = false;
+        out.push_back(c);
+    }
+    return out;
+}
+
+// Records the bot's /g line and reports whether the guild already said the same normalized line inside
+// the window. Called only for bot senders.
+bool IsRecentGuildRepeat(uint64 guild_id, Guild* g, std::string const& text, uint32_t now_ms)
+{
+    std::string norm = NormalizeGuildChat(text, g);
+    if (norm.empty())
+        return false;
+    std::lock_guard<std::mutex> lk(s_guild_react_mtx);
+    auto& dq = s_guild_recent_chat[guild_id];
+    while (!dq.empty() && now_ms - dq.front().ms >= kGuildRecentWindowMs)
+        dq.pop_front();
+    bool repeat = false;
+    for (auto const& e : dq)
+        if (e.norm == norm) { repeat = true; break; }
+    dq.push_back({ std::move(norm), now_ms });
+    if (dq.size() > kGuildRecentKeep)
+        dq.pop_front();
+    if (s_guild_recent_chat.size() > kReactMapPruneThreshold)
+        for (auto it = s_guild_recent_chat.begin(); it != s_guild_recent_chat.end();)
+            it = it->second.empty() ? s_guild_recent_chat.erase(it) : ++it;
+    return repeat;
+}
+
+// Conversation continuity: the bot that last answered a speaker is their partner for kGuildPartnerMs — a
+// follow-up without a name goes back to it, and a continuation (or a line that names a bot) is a directed
+// exchange that skips the ambient cooldown above; the per-bot cooldown inside Ask still applies.
+// Key: guild id << 32 | speaker guid.
+struct GuildPartner { BotId bot; uint32_t ms; };
+static std::unordered_map<uint64, GuildPartner>  s_guild_partner;   // s_guild_react_mtx
+constexpr uint32_t kGuildPartnerMs = 3u * 60u * 1000u;
+
 void BotChatReactor::ReactGuild(Player* sender, uint64 guild_id, std::string const& msg)
 {
     if (!sender || guild_id == 0 || msg.empty()) return;
+    // Playerbot.ChatModel: the model answers guild chat instead (ReactGuildModel, called from Module::OnGuildChat once the
+    // line is decided a real player's). While it is on, the keyword reply below stays out of the way.
+    if (BotChatModel::GuildOn()) return;
     // Filter bot speakers — same echo-storm guard as React().
     if (sender->GetSession() && sender->GetSession()->IsBot()) return;
     // Skip command prefixes / addon traffic that isn't social chat.
@@ -1207,19 +1314,13 @@ void BotChatReactor::ReactGuild(Player* sender, uint64 guild_id, std::string con
     Guild* g = sGuildMgr->GetGuildById(guild_id);
     if (!g) return;
 
-    // Per-guild throttle (separate from per-bot to coexist with party
-    // chat). 60s window — slightly looser than party's 90s because
-    // guild chat has fewer total speakers per minute on average and
-    // we want guild conversation to feel responsive.
-    static std::mutex                            s_guild_react_mtx;
-    static std::unordered_map<uint64, uint32_t>  s_last_guild_react_ms;
-    constexpr uint32_t kPerGuildReactCooldownMs = 60u * 1000u;
     const uint32 now_ms = GameTime::GetGameTimeMS();
+    const uint32 guild_cd_ms = Services::Config().chat_model().guild_cooldown_ms;
     {
         std::lock_guard<std::mutex> lk(s_guild_react_mtx);
         auto it = s_last_guild_react_ms.find(guild_id);
-        if (it != s_last_guild_react_ms.end() &&
-            now_ms - it->second < kPerGuildReactCooldownMs)
+        if (guild_cd_ms && it != s_last_guild_react_ms.end() &&
+            now_ms - it->second < guild_cd_ms)
             return;
         // Defer the stamp until after we successfully pick a speaker —
         // if no eligible officer exists, the next message gets a real
@@ -1293,12 +1394,12 @@ void BotChatReactor::ReactGuild(Player* sender, uint64 guild_id, std::string con
     // before the PickReply nullptr guard. With the guard added in
     // anticipation of future ReactKinds whose reply pool may be
     // conditional, an empty-reply path would otherwise silence the
-    // entire guild for the full 60s cooldown without anyone speaking.
+    // entire guild for the full cooldown without anyone speaking.
     {
         std::lock_guard<std::mutex> lk(s_guild_react_mtx);
         // SC-P3b: bound per-guild map growth — guilds form and disband over
         // a long uptime; sweep keys older than 2x the per-guild cooldown.
-        PruneStale(s_last_guild_react_ms, now_ms, 2u * kPerGuildReactCooldownMs,
+        PruneStale(s_last_guild_react_ms, now_ms, 2u * std::max(guild_cd_ms, 60000u),
                    kReactMapPruneThreshold);
         s_last_guild_react_ms[guild_id] = now_ms;
     }
@@ -1314,6 +1415,142 @@ void BotChatReactor::ReactGuild(Player* sender, uint64 guild_id, std::string con
     const uint32 jitter3   = (uint32(chosen.id) * 2654435761u) % 800u;
     it.defer_until_ms = now_ms + read_ms3 + type_ms3 + jitter3;
     Services::Intents(chosen.id).push(std::move(it));
+}
+
+// Playerbot.ChatModel / Playerbot.Bridge guild path: a real player's guild line gets a generated answer from one bot member —
+// a bot named in the line first, else the highest-rank candidate — on the same per-guild cooldown as the keyword reply.
+// A bot's guild line can be answered too, sometimes: that's what makes /g a conversation instead of parallel monologues.
+// Only a fraction of bot lines get an answer — the chance compounds per hop, so a reply chain dies out on its own —
+// and only with a real member online, the same audience rule every self-initiated guild line follows.
+// A line that names a bot, or continues the thread a bot already answered, is directed: the ambient per-guild
+// cooldown doesn't gate it and the answer goes back to the partner (or the named bot).
+// Called from Module::OnGuildChat; while it runs, ReactGuild's keyword reply is silent (GuildOn).
+void BotChatReactor::ReactGuildModel(Player* sender, uint64 guild_id, std::string const& msg)
+{
+    if (!sender || guild_id == 0 || msg.empty() || !BotChatModel::GuildOn()) return;
+    if (msg.front() == ';' || msg.front() == '.' || msg.front() == '/') return;
+    bool const from_bot = sender->GetSession() && sender->GetSession()->IsBot();
+    Guild* g = sGuildMgr->GetGuildById(guild_id);
+    if (!g) return;
+    const uint32 now_ms = GameTime::GetGameTimeMS();
+    auto const& chat_cfg = Services::Config().chat_model();
+    bool in_banter = false;
+    if (from_bot)
+    {
+        // A bot line inside GuildChainWindowSec of the last bot chatter in this guild is part of a
+        // live exchange: it keeps the thread hot (window refreshes on every bot line) and answers at
+        // GuildChainChance. An isolated bot line keeps the flat 35% and the ambient guild cooldown.
+        {
+            std::lock_guard<std::mutex> lk(s_guild_react_mtx);
+            auto it = s_last_guild_banter_ms.find(guild_id);
+            in_banter = it != s_last_guild_banter_ms.end() &&
+                        now_ms - it->second < chat_cfg.guild_chain_window_ms;
+            if (s_last_guild_banter_ms.size() > kReactMapPruneThreshold)
+                for (auto jt = s_last_guild_banter_ms.begin(); jt != s_last_guild_banter_ms.end();)
+                    jt = now_ms - jt->second >= chat_cfg.guild_chain_window_ms
+                         ? s_last_guild_banter_ms.erase(jt) : ++jt;
+            s_last_guild_banter_ms[guild_id] = now_ms;
+        }
+        if (IsRecentGuildRepeat(guild_id, g, msg, now_ms))
+            return;
+        if (urand(0, 99) >= int32(in_banter ? chat_cfg.guild_chain_chance : 35))
+            return;
+    }
+
+    const uint64 partner_key = (guild_id << 32) | uint64(sender->GetGUID().GetCounter());
+    BotId partner_bot = 0;
+    {
+        std::lock_guard<std::mutex> lk(s_guild_react_mtx);
+        if (auto it = s_guild_partner.find(partner_key);
+            it != s_guild_partner.end() && now_ms - it->second.ms < kGuildPartnerMs)
+            partner_bot = it->second.bot;
+    }
+
+    const std::string norm = Normalize(msg);
+    if (norm.size() < 2) return;
+
+    BotRegistry& reg = Services::Registry();
+    struct GCand
+    {
+        Player*    bot;
+        BotAI*     ai;
+        uint8      rank;
+        bool       named;
+        bool       partner;
+    };
+    std::vector<GCand> candidates;
+    candidates.reserve(8);
+    uint32 human_online = 0;
+
+    for (auto const& [mguid, member] : g->GetMembers())
+    {
+        if (!member.IsOnline()) continue;
+        if (mguid == sender->GetGUID()) continue;
+        Player* mp = ObjectAccessor::FindConnectedPlayer(mguid);
+        if (!mp || !mp->GetSession()) continue;
+        if (!mp->GetSession()->IsBot()) { ++human_online; continue; }
+        if (!mp->IsAlive()) continue;
+        const BotId mid = mguid.GetCounter();
+        if (!reg.has(mid)) continue;
+        BotAI* ai = reg.ai(mid);
+        if (!ai) continue;
+        const Verbosity v = ai->personality().verbosity;
+        if (v == Verbosity::Silent) continue;
+
+        const std::string first = FirstNameLower(mp->GetName());
+        const bool named = !first.empty() && first.size() >= 3 && ContainsWord(norm, first.c_str());
+        const bool partner = mid == partner_bot;
+        // A named bot answers whatever its chattiness, and so does the speaker's current partner — the thread is
+        // already theirs; a quiet bot speaks up unprompted only QuietChance of the time.
+        if (!named && !partner && v <= Verbosity::Terse &&
+            urand(0, 99) >= Services::Config().chat_model().quiet_chance)
+            continue;
+
+        candidates.push_back({mp, ai, static_cast<uint8>(member.GetRankId()), named, partner});
+    }
+    if (from_bot && human_online == 0) return;   // bots chatting among themselves still need a real member to read it
+    if (candidates.empty()) return;
+
+    // A directed line — it names a bot or continues a live thread — is answered whenever a bot can take it; an
+    // ambient line still shares the guild's cooldown (GuildCooldownSec) with the keyword path.
+    bool const directed = partner_bot != 0 || in_banter ||
+        std::any_of(candidates.begin(), candidates.end(), [](GCand const& c) { return c.named; });
+    if (!directed)
+    {
+        uint32 const guild_cd_ms = Services::Config().chat_model().guild_cooldown_ms;
+        std::lock_guard<std::mutex> lk(s_guild_react_mtx);
+        auto it = s_last_guild_react_ms.find(guild_id);
+        if (guild_cd_ms && it != s_last_guild_react_ms.end() && now_ms - it->second < guild_cd_ms)
+            return;
+        // Same deal as ReactGuild: the stamp lands only when a reply is confirmed queued, so a line nobody can take
+        // (cooldown / per-minute cap / queue) leaves the next message a real chance.
+    }
+
+    // Named bots first, then the speaker's current partner, then by rank ascending (lower rank id = higher real
+    // rank — the "talker" role answers).
+    std::sort(candidates.begin(), candidates.end(),
+        [](GCand const& a, GCand const& b) {
+            if (a.named != b.named) return a.named;
+            if (a.partner != b.partner) return a.partner;
+            return a.rank < b.rank;
+        });
+    auto const& chosen = candidates.front();
+
+    if (BotChatModel::Ask(chosen.bot, sender, MakeConvContext(chosen.bot, chosen.ai, sender), BotChatModel::Channel::Guild,
+                          msg))
+    {
+        std::lock_guard<std::mutex> lk(s_guild_react_mtx);
+        PruneStale(s_last_guild_react_ms, now_ms,
+                   2u * std::max(Services::Config().chat_model().guild_cooldown_ms, 60000u), kReactMapPruneThreshold);
+        s_last_guild_react_ms[guild_id] = now_ms;
+        if (s_guild_partner.size() > kReactMapPruneThreshold)
+            for (auto it = s_guild_partner.begin(); it != s_guild_partner.end();)
+                it = now_ms - it->second.ms >= kGuildPartnerMs ? s_guild_partner.erase(it) : ++it;
+        s_guild_partner[partner_key] = { chosen.bot->GetGUID().GetCounter(), now_ms };
+    }
+    else
+        TC_LOG_INFO("playerbot.v2", "[conv] guild <- {} \"{}\": {} did not take it (cooldown / per-minute cap / queue)",
+                    sender->GetName(), msg, chosen.bot->GetName());
 }
 
 namespace {
@@ -2000,11 +2237,12 @@ void BotChatReactor::ReactGuildJoin(uint64 guild_id, ObjectGuid joiner_guid,
     if (!g) return;
 
     // Don't welcome auto-spawned bot recruits — only real-player joins (a bot
-    // welcoming a bot is pure noise). The joining player may be offline at add
-    // time; if online and flagged as a bot, skip.
-    if (Player* jp = ObjectAccessor::FindConnectedPlayer(joiner_guid))
-        if (jp->GetSession() && jp->GetSession()->IsBot())
-            return;
+    // welcoming a bot is pure noise). The joiner is the audience: offline at
+    // add time (a player added while logged out, or a bot recruit still
+    // resting) means nobody is there to be welcomed.
+    Player* jp = ObjectAccessor::FindConnectedPlayer(joiner_guid);
+    if (!jp || !jp->GetSession() || jp->GetSession()->IsBot())
+        return;
 
     static std::mutex                           s_join_mtx;
     static std::unordered_map<uint64, uint32_t> s_last_join_ms;
@@ -2052,16 +2290,23 @@ void BotChatReactor::ReactGuildJoin(uint64 guild_id, ObjectGuid joiner_guid,
     // Compose a welcome line. Address the joiner by first name where possible.
     std::string first = joiner_name;
     if (auto sp = first.find(' '); sp != std::string::npos) first.resize(sp);
-    static constexpr char const* kTemplates[] = {
-        "welcome {}!", "welcome to the guild {} :)", "hey {}, welcome!",
-        "welcome aboard {}!", "{} welcome! :)", "glad to have you {}!",
-    };
-    constexpr size_t kN = sizeof(kTemplates) / sizeof(*kTemplates);
-    std::string line = kTemplates[seed % kN];
-    if (auto pos = line.find("{}"); pos != std::string::npos)
+    // Migration 9003: the text table's guild_join_welcome key first (%s = the joiner);
+    // the builtin templates otherwise, picked by the same stable seed.
+    std::string line = BotTextMgr::instance().Get("guild_join_welcome",
+        { { "%s", first.empty() ? std::string("friend") : first } });
+    if (line.empty())
     {
-        if (!first.empty()) line.replace(pos, 2, first);
-        else                line.replace(pos, 2, "friend");
+        static constexpr char const* kTemplates[] = {
+            "welcome {}!", "welcome to the guild {} :)", "hey {}, welcome!",
+            "welcome aboard {}!", "{} welcome! :)", "glad to have you {}!",
+        };
+        constexpr size_t kN = sizeof(kTemplates) / sizeof(*kTemplates);
+        line = kTemplates[seed % kN];
+        if (auto pos = line.find("{}"); pos != std::string::npos)
+        {
+            if (!first.empty()) line.replace(pos, 2, first);
+            else                line.replace(pos, 2, "friend");
+        }
     }
 
     // Stamp throttle only now that we will emit.
@@ -2072,6 +2317,12 @@ void BotChatReactor::ReactGuildJoin(uint64 guild_id, ObjectGuid joiner_guid,
                    kReactMapPruneThreshold);
         s_last_join_ms[guild_id] = now_ms;
     }
+
+    // With a program answering chat (Playerbot.Bridge), it writes the welcome instead: the joiner is a real guild member,
+    // so a guild moment with the fixed line as its example.
+    if (BotBridge::QueueMoment(greeter, "welcome",
+            fmt::format("welcome {}, who just joined the guild", first.empty() ? joiner_name : first), line, "guild"))
+        return;
 
     Intent it{};
     it.bot_id = greeter;

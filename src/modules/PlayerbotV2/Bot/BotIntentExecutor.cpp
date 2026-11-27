@@ -18,6 +18,7 @@
 #include "../PlayerbotV2.h"
 #include "../Diagnostics/PerfCounters.h"
 #include "BotTextMgr.h"
+#include "BotBridge.h"
 #include "RezClaims.h"
 #include "../Combat/Apl/HealClaimStore.h"
 #include "CombatManager.h"
@@ -440,7 +441,21 @@ struct IntentVisitor
             if      constexpr (std::is_same_v<T, SayChatIntent>)      return api.say(op.text);
             else if constexpr (std::is_same_v<T, YellChatIntent>)     return api.yell(op.text);
             else if constexpr (std::is_same_v<T, EmoteChatIntent>)    return api.emote_text(op.text);
-            else if constexpr (std::is_same_v<T, GuildChatIntent>)    return api.guild_chat(op.text);
+            else if constexpr (std::is_same_v<T, GuildChatIntent>)
+            {
+                Result const r = api.guild_chat(op.text);
+                // A bot's /g line never passes Module::OnGuildChat — feed the bridge's chat_log here or
+                // the log (and the program reading it) only ever sees the humans' half of a conversation,
+                // and queue it for the guild reactor or bots could never answer each other's lines.
+                if (r == Result::Ok)
+                    if (Player const* p = api.player())
+                    {
+                        uint64 const gid = p->GetGuildId();
+                        BotBridge::NoteGuildChat(gid, p->GetName(), op.text, true);
+                        BotBridge::NoteGuildBotChat(p->GetGUID().GetCounter(), gid, op.text);
+                    }
+                return r;
+            }
             else if constexpr (std::is_same_v<T, RaidChatIntent>)     return api.raid_chat(op.text);
             else if constexpr (std::is_same_v<T, OfficerChatIntent>)  return api.officer_chat(op.text);
             else if constexpr (std::is_same_v<T, RaidWarningIntent>)  return api.raid_warning(op.text);

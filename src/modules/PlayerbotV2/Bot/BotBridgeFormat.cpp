@@ -630,17 +630,39 @@ std::uint32_t RepeatCounter::Hit(std::string const& key, std::uint64_t now_ms, s
 std::string CleanSayText(std::string const& raw, std::size_t max_bytes)
 {
     std::string line;
-    for (char c : raw)
+    for (std::size_t i = 0; i < raw.size();)
     {
-        if (c == '\n' || c == '\r')
+        unsigned char const c = static_cast<unsigned char>(raw[i]);
+        if (c < 0x80)
         {
-            if (!line.empty())
-                break;
+            if (c == '\n' || c == '\r')
+            {
+                if (!line.empty())
+                    break;
+                ++i;
+                continue;
+            }
+            if (c != '|' && (c >= 0x20 || c == '\t'))
+                line += c == '\t' ? ' ' : char(c);
+            ++i;
             continue;
         }
-        if (c == '|' || (static_cast<unsigned char>(c) < 0x20 && c != '\t'))
-            continue;
-        line += c == '\t' ? ' ' : c;
+        // A multi-byte UTF-8 character. A 1.12-era client renders ASCII, Latin-1 (é, ü, ñ) and Cyrillic (ruRU);
+        // anything else — emoji, dingbats, arrows, CJK — shows as a blank square, so the character is dropped.
+        std::size_t const len = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        if (i + len > raw.size())
+            break;
+        std::uint32_t cp = 0xFFFD;
+        if (len == 2)
+            cp = (std::uint32_t(c & 0x1F) << 6) | (raw[i + 1] & 0x3F);
+        else if (len == 3)
+            cp = (std::uint32_t(c & 0x0F) << 12) | (std::uint32_t(raw[i + 1] & 0x3F) << 6) | (raw[i + 2] & 0x3F);
+        else if (len == 4)
+            cp = (std::uint32_t(c & 0x07) << 18) | (std::uint32_t(raw[i + 1] & 0x3F) << 12) |
+                 (std::uint32_t(raw[i + 2] & 0x3F) << 6) | (raw[i + 3] & 0x3F);
+        if (cp <= 0xFF || (cp >= 0x400 && cp <= 0x4FF))
+            line.append(raw, i, len);
+        i += len;
     }
     auto const first = line.find_first_not_of(' ');
     if (first == std::string::npos)

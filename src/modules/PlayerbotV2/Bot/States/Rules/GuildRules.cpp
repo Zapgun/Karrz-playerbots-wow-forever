@@ -23,6 +23,8 @@
 #include "Bot/BotSnapshotView.h"
 #include "Bot/BotIntentEmitter.h"
 #include "Bot/BotIntent.h"
+#include "Bot/BotBridge.h"
+#include "Bot/BotTextMgr.h"
 #include "Services.h"
 #include "Fleet/BotGuildMgr.h"
 #include "Fleet/BotGuildEvent.h"
@@ -36,6 +38,8 @@
 #include "UnitDefines.h"
 
 #include <cmath>
+#include <mutex>
+#include <unordered_map>
 #include <fmt/format.h>
 
 namespace Playerbot {
@@ -423,10 +427,54 @@ bool GuildChatQuietGate(BotSnapshotView const& s, BotAI&, GroupSnapshotView cons
     return true;
 }
 
+// A /g line needs a real guild member online to hear it: without one, guild chat is bots talking to an
+// empty channel — the gate stays closed so the line waits for an audience instead of being spent unheard.
+// RecruitChannelGate keeps the plain QuietGate on purpose: its post goes to a public channel, where
+// recruiting for a bot-only guild is the point. The event HoldGates keep it too: the gathering itself
+// still happens, only the chatter waits.
+bool GuildChatAudienceGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
+{
+    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    return s.guild_online_human_member_count() > 0;
+}
+
+// Migration 9003 moved the chat pools below into the shared text table (guild_* keys), so a realm
+// can rewrite guild speech without rebuilding. GuildLine returns a table line for `key` when the
+// table carries any; a `pool` line otherwise (placeholders filled the same way), so a server
+// without the rows talks exactly as before.
+std::string GuildLine(char const* key, BotAI& ai, char const* const* pool, size_t pool_n,
+                      TextPlaceholders const& ph = {})
+{
+    if (std::string line = BotTextMgr::instance().Get(key, ph); !line.empty())
+        return line;
+    std::string line = pool[ai.rng().int_range(0, int32_t(pool_n))];
+    BotTextMgr::Fill(line, ph);
+    return line;
+}
+
+// A guild line the bot bridge may write instead: the fixed line comes first (the text table or the builtin pool), then
+// with a real guild member online it is handed to the bridge as a "guild" moment — the program's answer is said in /g.
+// Moments off, no program answering, or a bot-only guild — the fixed line is said as before.
+void SayGuildLine(BotSnapshotView const& s, BotIntentEmitter& emit, char const* what, std::string detail,
+                  std::string line)
+{
+    if (s.guild_online_human_member_count() > 0 &&
+        BotBridge::QueueMoment(s.bot_id(), what, std::move(detail), line, "guild"))
+        return;
+    emit.guild_chat(std::move(line));
+}
+
+void SayGuild(BotSnapshotView const& s, BotAI& ai, BotIntentEmitter& emit, char const* key,
+              char const* const* pool, size_t pool_n, char const* what, std::string detail,
+              TextPlaceholders const& ph = {})
+{
+    SayGuildLine(s, emit, what, std::move(detail), GuildLine(key, ai, pool, pool_n, ph));
+}
+
 // ---------- idle:guild_chat:ding ----------
 bool ChatDingGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     return s.level() > ai.guild_chat_last_ding_level();
 }
 
@@ -439,11 +487,11 @@ bool ChatDingFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& 
         return false;
     }
     static constexpr char const* kDingVariants[] = {
-        "Ding {}!", "{} achieved", "hit {} :)", "Level {}!", "ding {}",
+        "Ding %my_level!", "%my_level achieved", "hit %my_level :)", "Level %my_level!", "ding %my_level",
     };
-    const int32_t n_dings = static_cast<int32_t>(sizeof(kDingVariants) / sizeof(*kDingVariants));
-    const size_t idx = static_cast<size_t>(ai.rng().int_range(0, n_dings));
-    emit.guild_chat(fmt::format(fmt::runtime(kDingVariants[idx]), s.level()));
+    SayGuild(s, ai, emit, "guild_ding", kDingVariants, 5, "ding",
+             fmt::format("you reached level {}", s.level()),
+             { { "%my_level", std::to_string(s.level()) } });
     // Party-chat ding is handled separately in BotAI::tick (the
     // pending_ding_level_ stagger path) — don't double-emit here.
     ai.set_guild_chat_last_ding_level(s.level());
@@ -452,11 +500,29 @@ bool ChatDingFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& 
 }
 
 // ---------- idle:guild_chat:login_greet ----------
+// Greet density: a mass login (realm restart, fleet relog) does not produce a wall of "hi all" — only a share of
+// the logging-in bots greet at all (one roll, a loser stamps greeted and never retries), and the winners take
+// slots a random kGuildGreetMinMs..kGuildGreetMaxMs apart per guild (a bot that misses keeps its turn: its own
+// greet stamp is only set on fire). The shared map holds the earliest ms the guild's next greet may fire; bot-
+// managed guilds are few enough not to need pruning.
+std::mutex  s_guild_greet_mtx;
+std::unordered_map<uint64, uint32> s_next_guild_greet_ms;
+constexpr uint32 kGuildGreetChancePct = 75;
+constexpr int32  kGuildGreetMinMs = 500, kGuildGreetMaxMs = 1500;
+
 bool ChatLoginGreetGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
-    return ai.guild_chat_login_greeted_ms() == 0 &&
-           s.guild_online_member_count() >= 2;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
+    if (ai.guild_chat_login_greeted_ms() != 0 || s.guild_online_member_count() < 2) return false;
+    if (ai.rng().int_range(0, 99) >= int32_t(kGuildGreetChancePct))
+    {
+        ai.note_guild_chat_login_greet(GameTime::GetGameTimeMS());
+        return false;
+    }
+    uint32 const gc_now_ms = GameTime::GetGameTimeMS();
+    std::lock_guard<std::mutex> lk(s_guild_greet_mtx);
+    auto it = s_next_guild_greet_ms.find(s.guild_id());
+    return it == s_next_guild_greet_ms.end() || int32(gc_now_ms - it->second) >= 0;
 }
 
 bool ChatLoginGreetFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit, uint32)
@@ -465,11 +531,14 @@ bool ChatLoginGreetFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView c
         "hi all", "hey :)", "o/", "hello!", "evening", "yo",
         "hi guild", "hey hey", "o/ everyone", "back online",
     };
-    const int32_t n_greets = static_cast<int32_t>(sizeof(kGreetVariants) / sizeof(*kGreetVariants));
-    const size_t idx = static_cast<size_t>(ai.rng().int_range(0, n_greets));
-    emit.guild_chat(kGreetVariants[idx]);
-    ai.note_guild_chat_login_greet(GameTime::GetGameTimeMS());
-    (void)s;
+    SayGuild(s, ai, emit, "guild_login_greet", kGreetVariants, 10, "login_greet",
+             "you just came online; say hello to your guild");
+    uint32 const gc_now_ms = GameTime::GetGameTimeMS();
+    ai.note_guild_chat_login_greet(gc_now_ms);
+    {
+        std::lock_guard<std::mutex> lk(s_guild_greet_mtx);
+        s_next_guild_greet_ms[s.guild_id()] = gc_now_ms + uint32(ai.rng().int_range(kGuildGreetMinMs, kGuildGreetMaxMs));
+    }
     ai.set_last_rule_fired("idle:guild_chat:login_greet");
     return true;
 }
@@ -477,12 +546,7 @@ bool ChatLoginGreetFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView c
 // ---------- idle:guild_chat:smalltalk ----------
 bool ChatSmalltalkGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
-    // SC-P3c: require at least one ONLINE human guildmate. Smalltalk is
-    // self-initiated ambient chatter; with no human in the guild it's bots
-    // babbling to each other, which is pointless traffic and reads as a tell.
-    // Reactive announces (ding/login_greet/quest_brag) stay unconditional.
-    if (s.guild_online_human_member_count() < 1) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     if (s.guild_online_member_count() < 3) return false;
     const uint32 gc_now_ms = GameTime::GetGameTimeMS();
     if (ai.guild_chat_last_smalltalk_ms() != 0 &&
@@ -491,41 +555,80 @@ bool ChatSmalltalkGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView co
     return ai.rng().int_range(0, 100) == 0;
 }
 
-bool ChatSmalltalkFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit, uint32)
+// Shared by idle:guild_chat:smalltalk and idle:guild_chat:banter — the banter pulse is the same casual-chat
+// pool on a faster per-guild cadence (the guild_smalltalk text-table key supplies the SQL rows).
+constexpr char const* kSmalltalkVariants[] = {
+    "anyone need help with anything?", "what's good tonight folks",
+    "soloing this is rough", "anyone running dungeons?",
+    "pulled too much again, classic", "where is everyone leveling?",
+    "the new patch feels good", "anyone got mats to spare?",
+    "drinking tea, brb", "good run earlier, ty",
+    "checking AH brb", "this zone is gorgeous",
+    "lf groupmates for tonight", "back from a break, hi all",
+    "rolling around questing", "anyone seen [redacted-name] online?",
+    "love this server", "phase is acting weird, anyone else?",
+    "great patch notes today", "stretch break",
+    "tea then back to grinding", "anyone need a port?",
+    "this mount drop is brutal", "looking for a leveling buddy",
+    "kicking back, easy night", "anyone want to chain quests?",
+    "this rep grind...", "soloing dungeons for chests",
+    "wow my repair bill", "good music tonight, share recs",
+};
+constexpr size_t kSmalltalkCount = sizeof(kSmalltalkVariants) / sizeof(kSmalltalkVariants[0]);
+
+bool ChatSmalltalkFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit, uint32)
 {
-    static constexpr char const* kSmalltalkVariants[] = {
-        "anyone need help with anything?", "what's good tonight folks",
-        "soloing this is rough", "anyone running dungeons?",
-        "pulled too much again, classic", "where is everyone leveling?",
-        "the new patch feels good", "anyone got mats to spare?",
-        "drinking tea, brb", "good run earlier, ty",
-        "checking AH brb", "this zone is gorgeous",
-        "lf groupmates for tonight", "back from a break, hi all",
-        "rolling around questing", "anyone seen [redacted-name] online?",
-        "love this server", "phase is acting weird, anyone else?",
-        "great patch notes today", "stretch break",
-        "tea then back to grinding", "anyone need a port?",
-        "this mount drop is brutal", "looking for a leveling buddy",
-        "kicking back, easy night", "anyone want to chain quests?",
-        "this rep grind...", "soloing dungeons for chests",
-        "wow my repair bill", "good music tonight, share recs",
-    };
-    const int32_t n_st = static_cast<int32_t>(sizeof(kSmalltalkVariants) / sizeof(*kSmalltalkVariants));
-    const size_t idx = static_cast<size_t>(ai.rng().int_range(0, n_st));
-    emit.guild_chat(kSmalltalkVariants[idx]);
+    SayGuild(s, ai, emit, "guild_smalltalk", kSmalltalkVariants, uint32(kSmalltalkCount), "smalltalk",
+             "you feel like saying something to your guild");
     ai.note_guild_chat_smalltalk(GameTime::GetGameTimeMS());
     ai.set_last_rule_fired("idle:guild_chat:smalltalk");
+    return true;
+}
+
+// ---------- idle:guild_chat:banter ----------
+// The ambient-seed problem: greets are once-per-login and every other chat rule runs on 10-60min
+// per-bot cadences, so /g goes quiet for long stretches while a human member is online. This pulse
+// is per-GUILD instead: GuildBanterSec spacing (one shared next-slot per guild) and whichever guild
+// bot's gate eval lands first after the slot takes it — a per-bot stamp (15min) keeps the turns
+// rotating instead of the same talker winning every eval.
+std::mutex  s_guild_banter_mtx;
+std::unordered_map<uint64, uint32> s_next_guild_banter_ms;
+constexpr uint32 kBanterBotCooldownMs = 15u * 60u * 1000u;
+
+bool ChatBanterGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
+{
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
+    const uint32 banter_ms = Services::Config().chat_model().guild_banter_ms;
+    if (!banter_ms) return false;
+    if (ai.guild_chat_last_banter_ms() != 0 &&
+        now_ms - ai.guild_chat_last_banter_ms() < kBanterBotCooldownMs)
+        return false;
+    std::lock_guard<std::mutex> lk(s_guild_banter_mtx);
+    auto it = s_next_guild_banter_ms.find(s.guild_id());
+    return it == s_next_guild_banter_ms.end() || int32(now_ms - it->second) >= 0;
+}
+
+bool ChatBanterFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit, uint32)
+{
+    SayGuild(s, ai, emit, "guild_smalltalk", kSmalltalkVariants, uint32(kSmalltalkCount), "banter",
+             "you make small talk in guild chat");
+    const uint32 now_ms = GameTime::GetGameTimeMS();
+    ai.note_guild_chat_banter(now_ms);
+    const uint32 banter_ms = Services::Config().chat_model().guild_banter_ms;
+    if (banter_ms)
+    {
+        std::lock_guard<std::mutex> lk(s_guild_banter_mtx);
+        s_next_guild_banter_ms[s.guild_id()] = now_ms + banter_ms + ai.rng().int_range(0, int32(banter_ms / 4));
+    }
+    ai.set_last_rule_fired("idle:guild_chat:banter");
     return true;
 }
 
 // ---------- idle:guild_chat:tavern_hangout ----------
 bool ChatTavernHangoutGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
-    // SC-P3c: the tavern-hangout pitch is broadcast to /g, so it needs a
-    // human audience to be worth sending. (The cluster check below only
-    // confirms 2+ guildmates are physically nearby — those can all be bots.)
-    if (s.guild_online_human_member_count() < 1) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
+    // The cluster check below confirms 2+ guildmates are physically nearby — those can all be bots.
     const uint32 gc_now_ms = GameTime::GetGameTimeMS();
     if (ai.guild_chat_last_hangout_ms() != 0 &&
         gc_now_ms - ai.guild_chat_last_hangout_ms() <= 60u * 60u * 1000u)
@@ -547,7 +650,10 @@ bool ChatTavernHangoutFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotVie
     const auto kHFaction = FactionOf(s);
     char const* venue = (kHFaction == ::Playerbot::V2::BotGuildMgr::FACTION_ALLIANCE)
         ? "Pig & Whistle" : "Wyvern's Tail";
-    emit.guild_chat(fmt::format("anyone want to hit the tavern? {}", venue));
+    static constexpr char const* kHangoutLine[] = { "anyone want to hit the tavern? %venue" };
+    SayGuild(s, ai, emit, "guild_tavern_hangout", kHangoutLine, 1, "tavern",
+             std::string("your guild is meeting at ") + venue + " for a tavern night",
+             { { "%venue", venue } });
     ai.note_guild_chat_hangout(GameTime::GetGameTimeMS());
     ai.set_last_rule_fired("idle:guild_chat:tavern_hangout");
     return true;
@@ -556,7 +662,7 @@ bool ChatTavernHangoutFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotVie
 // ---------- idle:guild_chat:rival_banter ----------
 bool ChatRivalBanterGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     if (s.guild_rival_id() == 0) return false;
     const uint32 gc_now_ms = GameTime::GetGameTimeMS();
     if (ai.guild_chat_last_smalltalk_ms() != 0 &&
@@ -571,7 +677,7 @@ bool ChatRivalBanterGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView 
     return false;
 }
 
-bool ChatRivalBanterFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit, uint32)
+bool ChatRivalBanterFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit, uint32)
 {
     static constexpr char const* kRivalLines[] = {
         "rival guild spotted", "show them how it's done",
@@ -579,9 +685,8 @@ bool ChatRivalBanterFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView co
         "watch the rivals here", "let's outperform them",
         "rival in sight, on guard", "amateurs",
     };
-    const int32_t n_rv = sizeof(kRivalLines) / sizeof(*kRivalLines);
-    const size_t ri = static_cast<size_t>(ai.rng().int_range(0, n_rv));
-    emit.guild_chat(kRivalLines[ri]);
+    SayGuild(s, ai, emit, "guild_rival", kRivalLines, 8, "rival",
+             "you tease your guild's rivals in guild chat");
     ai.note_guild_chat_smalltalk(GameTime::GetGameTimeMS());
     ai.set_last_rule_fired("idle:guild_chat:rival_banter");
     return true;
@@ -590,7 +695,7 @@ bool ChatRivalBanterFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView co
 // ---------- idle:guild_chat:quest_brag ----------
 bool ChatQuestBragGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     const uint16 quest_count_now = s.completed_quest_count();
     if (ai.guild_chat_last_seen_quest_count() == 0xFFFF)
     {
@@ -624,9 +729,8 @@ bool ChatQuestBragFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView co
         "easy gold", "quest hub clear",
         "love a good quest chain", "rolling through quests",
     };
-    const int32_t n_br = sizeof(kBragVariants) / sizeof(*kBragVariants);
-    const size_t bi = static_cast<size_t>(ai.rng().int_range(0, n_br));
-    emit.guild_chat(kBragVariants[bi]);
+    SayGuild(s, ai, emit, "guild_quest_brag", kBragVariants, 10, "quest_brag",
+             "you brag in guild chat about a quest you just finished");
     ai.note_guild_chat_brag(GameTime::GetGameTimeMS());
     ai.set_last_rule_fired("idle:guild_chat:quest_brag");
     return true;
@@ -635,7 +739,7 @@ bool ChatQuestBragFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView co
 // ---------- idle:guild_chat:lfm_pulse ----------
 bool ChatLfmPulseGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     const uint32 gc_now_ms = GameTime::GetGameTimeMS();
     if (!s.lfg_in_queue())
     {
@@ -654,9 +758,11 @@ bool ChatLfmPulseGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView con
     return over_threshold && cooldown_ok;
 }
 
-bool ChatLfmPulseFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit, uint32)
+bool ChatLfmPulseFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, BotIntentEmitter& emit, uint32)
 {
-    emit.guild_chat("LFM for a dungeon, anyone?");
+    static constexpr char const* kLfmLine[] = { "LFM for a dungeon, anyone?" };
+    SayGuild(s, ai, emit, "guild_lfm", kLfmLine, 1, "lfm",
+             "you have been waiting in a group finder queue for a while; you look for people in guild chat");
     ai.note_guild_chat_lfm(GameTime::GetGameTimeMS());
     ai.set_last_rule_fired("idle:guild_chat:lfm_pulse");
     return true;
@@ -665,7 +771,7 @@ bool ChatLfmPulseFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView const
 // ---------- idle:guild_event:announce ----------
 bool EventAnnounceGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     return s.guild_has_pending_callout() && s.guild_rank_id() <= 1;
 }
 
@@ -684,7 +790,13 @@ bool EventAnnounceFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView co
         case ::Playerbot::V2::GuildEventKind::BgNight:      event_label = "BG night"; break;
         default: break;
     }
-    emit.guild_chat(fmt::format("{} starts in {} min!", event_label, mins_until));
+    std::string line = BotTextMgr::instance().Get("guild_event_announce",
+        { { "%event_label", event_label }, { "%mins_until", std::to_string(mins_until) } });
+    if (line.empty())
+        line = fmt::format("{} starts in {} min!", event_label, mins_until);
+    SayGuildLine(s, emit, "event_announce",
+                 fmt::format("you announce your guild's {}: it starts in {} minutes", event_label, mins_until),
+                 std::move(line));
     ai.set_last_rule_fired("idle:guild_event:announce");
     return true;
 }
@@ -785,12 +897,12 @@ bool EventStagingHoldFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView
 // ---------- idle:guild_event:tavern (dance / chat, in its place) ----------
 bool EventTavernGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     EventPlace p;
     return GuildEventPlace(s, /*tavern*/ true, p) && p.dist <= kEventPlaceReach;
 }
 
-bool EventTavernFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
+bool EventTavernFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const&, BotIntentEmitter& emit, uint32)
 {
     static constexpr uint32 kPartyEmotes[] = {
         10, 4, 3, 5, 71,
@@ -811,9 +923,8 @@ bool EventTavernFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView const&
             "more bots should hit the tavern", "great turnout",
             "tavern night incoming", "rolling tipsy", "/toast",
         };
-        const int32_t n_pc = sizeof(kPartyChat) / sizeof(*kPartyChat);
-        const size_t pi = static_cast<size_t>(ai.rng().int_range(0, n_pc));
-        emit.guild_chat(kPartyChat[pi]);
+        SayGuild(s, ai, emit, "guild_tavern_chat", kPartyChat, 10, "tavern_chat",
+                 "you chat with your guild at its tavern night");
         ai.set_last_rule_fired("idle:guild_event:tavern_chat");
         return true;
     }
@@ -823,7 +934,7 @@ bool EventTavernFire(BotSnapshotView const&, BotAI& ai, GroupSnapshotView const&
 // ---------- idle:guild_event:staging (chat, in its place) ----------
 bool EventStagingGate(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const& g, uint32 now_ms)
 {
-    if (!GuildChatQuietGate(s, ai, g, now_ms)) return false;
+    if (!GuildChatAudienceGate(s, ai, g, now_ms)) return false;
     EventPlace p;
     return GuildEventPlace(s, /*tavern*/ false, p) && p.dist <= kEventPlaceReach;
 }
@@ -833,35 +944,43 @@ bool EventStagingFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView con
     const uint8 active_kind = s.guild_active_event_kind();
     if (ai.rng().int_range(0, 30) == 0)
     {
-        char const* line = "anyone joining?";
+        static constexpr char const* kGeneric[] = { "anyone joining?" };
+        static constexpr char const* kRaidLines[] = {
+            "raid night, who's in?", "rolling for raid spots",
+            "/g raid in 10", "looking for one more dps",
+            "loot reservations open",
+        };
+        static constexpr char const* kDungeonLines[] = {
+            "dungeon night, who's down?", "lf2m for keys",
+            "let's chain some 5-mans", "got a healer?",
+            "rolling tank dual spec",
+        };
+        static constexpr char const* kBgLines[] = {
+            "BG night! /join wsg", "premade rolling",
+            "honor cap incoming", "anyone seen the queue times?",
+            "rated arena later maybe",
+        };
+        char const* key = "guild_staging_generic";
+        char const* const* pool = kGeneric;
+        size_t pool_n = 1;
+        char const* gathering = "a guild event";
         if (active_kind == static_cast<uint8>(::Playerbot::V2::GuildEventKind::RaidNight))
         {
-            static constexpr char const* kRaidLines[] = {
-                "raid night, who's in?", "rolling for raid spots",
-                "/g raid in 10", "looking for one more dps",
-                "loot reservations open",
-            };
-            line = kRaidLines[ai.rng().int_range(0, 5)];
+            key = "guild_staging_raid"; pool = kRaidLines; pool_n = 5;
+            gathering = "a raid night";
         }
         else if (active_kind == static_cast<uint8>(::Playerbot::V2::GuildEventKind::DungeonNight))
         {
-            static constexpr char const* kDungeonLines[] = {
-                "dungeon night, who's down?", "lf2m for keys",
-                "let's chain some 5-mans", "got a healer?",
-                "rolling tank dual spec",
-            };
-            line = kDungeonLines[ai.rng().int_range(0, 5)];
+            key = "guild_staging_dungeon"; pool = kDungeonLines; pool_n = 5;
+            gathering = "a dungeon night";
         }
-        else
+        else if (active_kind == static_cast<uint8>(::Playerbot::V2::GuildEventKind::BgNight))
         {
-            static constexpr char const* kBgLines[] = {
-                "BG night! /join wsg", "premade rolling",
-                "honor cap incoming", "anyone seen the queue times?",
-                "rated arena later maybe",
-            };
-            line = kBgLines[ai.rng().int_range(0, 5)];
+            key = "guild_staging_bg"; pool = kBgLines; pool_n = 5;
+            gathering = "a battleground night";
         }
-        emit.guild_chat(line);
+        SayGuild(s, ai, emit, key, pool, pool_n, "staging",
+                 std::string("your guild is gathering for ") + gathering);
         ai.set_last_rule_fired("idle:guild_event:staging_chat");
         return true;
     }
@@ -933,10 +1052,15 @@ bool ChatBabbleFire(BotSnapshotView const& s, BotAI& ai, GroupSnapshotView const
         "Just dinged again — slow grind.",
         "Hope to see folks at the next raid night.",
     };
-    constexpr uint32 kPoolSize = sizeof(kPhrases) / sizeof(kPhrases[0]);
-    const uint32 bucket = now_ms / kBabbleThrottleMs;
-    const uint32 sel = (s.bot_id() ^ bucket) % kPoolSize;
-    emit.emit(ChatIntent{GuildChatIntent{std::string(kPhrases[sel])}});
+    std::string line = BotTextMgr::instance().Get("guild_babble");
+    if (line.empty())
+    {
+        // No table rows: the builtin pool, with its deterministic per-bot pick kept as it was.
+        constexpr uint32 kPoolSize = sizeof(kPhrases) / sizeof(kPhrases[0]);
+        const uint32 bucket = now_ms / kBabbleThrottleMs;
+        line = kPhrases[(s.bot_id() ^ bucket) % kPoolSize];
+    }
+    SayGuildLine(s, emit, "babble", "you say something to your guild", std::move(line));
     ai.set_last_guild_babble_ms(now_ms);
     ai.set_last_rule_fired("idle:guild_chat_babble");
     return true;
@@ -1003,6 +1127,15 @@ void RegisterGuildRules(IdleRuleRegistry& r)
         rule.gate     = &ChatLoginGreetGate;
         rule.fire     = &ChatLoginGreetFire;
         rule.min_interval_ms = 3000;
+        r.register_rule(std::move(rule));
+    }
+    {
+        IdleRule rule;
+        rule.name     = "idle:guild_chat:banter";
+        rule.priority = 337;
+        rule.gate     = &ChatBanterGate;
+        rule.fire     = &ChatBanterFire;
+        rule.min_interval_ms = 5000;
         r.register_rule(std::move(rule));
     }
     {

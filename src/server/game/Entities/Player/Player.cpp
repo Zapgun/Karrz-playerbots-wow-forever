@@ -2143,6 +2143,34 @@ void Player::SetGMVisible(bool on)
 
     for (Channel* channel : m_channels)
         channel->SetInvisible(this, !on);
+
+    UpdateInvisibilityVisFlags();
+}
+
+void Player::UpdateInvisibilityVisFlags()
+{
+    // GM-invisible players get the invisibility spell's state visual so their own model renders
+    // the transparent look (like the invisibility potion) as a reminder the flag is on; a real
+    // invisibility aura does the same, so only clear it when neither applies.
+    static int32 gmVisualId = -1;
+    if (gmVisualId < 0)
+    {
+        gmVisualId = 0;
+        for (uint32 spellId : { 11392u, 7870u, 66u, 3680u })   // Invisibility / Lesser Invisibility (potion + succubus + mage)
+            if (SpellInfo const* si = sSpellMgr->GetSpellInfo(spellId, DIFFICULTY_NONE))
+                if (uint32 v = si->GetSpellVisual(this, this))
+                {
+                    gmVisualId = int32(v);
+                    break;
+                }
+    }
+
+    bool show = m_invisibility.GetFlags() != 0 || !isGMVisible();
+    int32 cur = *m_unitData->StateSpellVisualID;
+    if (show && cur != gmVisualId && gmVisualId != 0)
+        SetUpdateFieldValue(m_values.ModifyValue(&Player::m_unitData).ModifyValue(&UF::UnitData::StateSpellVisualID), gmVisualId);
+    else if (!show && cur == gmVisualId && gmVisualId != 0)  // only remove our own visual, quest/other state visuals are not ours to touch
+        SetUpdateFieldValue(m_values.ModifyValue(&Player::m_unitData).ModifyValue(&UF::UnitData::StateSpellVisualID), 0);
 }
 
 bool Player::IsGroupVisibleFor(Player const* p) const
@@ -25795,6 +25823,8 @@ void Player::UpdateObjectVisibility(bool forced)
     // Prevent updating visibility if player is not in world (example: LoadFromDB sets drunkstate which updates invisibility while player is not in map)
     if (!IsInWorld())
         return;
+
+    UpdateInvisibilityVisFlags();
 
     if (!forced)
         AddToNotify(NOTIFY_VISIBILITY_CHANGED);

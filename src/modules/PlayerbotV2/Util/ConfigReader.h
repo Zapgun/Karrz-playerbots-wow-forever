@@ -381,6 +381,7 @@ public:
         bool        whispers          = true;
         bool        party             = true;
         bool        say_reply         = true;
+        bool        guild             = true;
         std::string host              = "127.0.0.1";
         uint32      port              = 11434;
         std::string model             = "llama3.2:3b";
@@ -398,6 +399,10 @@ public:
         bool        date_in_prompt    = true;
         uint32      bot_cooldown_ms   = 3000;
         uint32      group_cooldown_ms = 0;
+        uint32      guild_cooldown_ms = 15000;
+        uint32      guild_chain_chance = 65;
+        uint32      guild_chain_window_ms = 75000;
+        uint32      guild_banter_ms   = 120000;
         uint32      max_per_minute    = 30;
         uint32      max_queue         = 6;
         uint32      max_wait_ms       = 60000;

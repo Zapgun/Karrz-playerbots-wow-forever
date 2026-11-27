@@ -59,8 +59,12 @@ public:
     // queue. No-op when:
     //   - Sender is a bot (avoids echo storms).
     //   - Guild has no online officer bot.
-    //   - Reactor's per-guild throttle (60s) is hot.
+    //   - Reactor's per-guild throttle (Playerbot.ChatModel.GuildCooldownSec) is hot.
     static void ReactGuild(Player* sender, uint64 guild_id, std::string const& msg);
+    // Playerbot.ChatModel / bot-bridge guild path: the model answers a real player's guild line (one named bot first, else
+    // the highest-rank candidate, same per-guild cooldown as ReactGuild). Called from Module::OnGuildChat; ReactGuild's
+    // keyword reply stays silent while GuildOn.
+    static void ReactGuildModel(Player* sender, uint64 guild_id, std::string const& msg);
 
     // SC-P1a /say reactor. Called from Module::OnSayChat for every /say a
     // real player makes. Runs a grid-bounded range query anchored on the
